@@ -1,0 +1,91 @@
+import streamlit as st
+
+from ui.components import sidebar_brand, sidebar_profile, streak_card
+
+NAV = [
+    ("home", "⌂  Home"),
+    ("learn", "◈  Learn"),
+    ("progress", "◫  Progress"),
+    ("history", "◷  History"),
+    ("library", "◉  Resources"),
+]
+
+PLAN_NAV = ("study_plan", "◷  Study Plan")
+
+
+def initialize_navigation():
+    st.session_state.setdefault("current_view", "home")
+
+
+def render_sidebar(learner=None, subjects=None, active_subject=None, track_profiles=None):
+    initialize_navigation()
+    subjects = subjects or []
+    track_profiles = track_profiles or {}
+
+    with st.sidebar:
+        sidebar_brand()
+        if learner:
+            sidebar_profile(
+                getattr(learner, "name", "Learner"),
+                getattr(learner, "current_level", ""),
+            )
+
+        st.markdown('<div class="nav-label">LEARNING TRACKS</div>', unsafe_allow_html=True)
+        for subject in subjects:
+            selected = subject == active_subject
+            exists = subject in track_profiles
+            label = f"{subject}  ✓" if selected and exists else subject
+            if st.button(
+                label,
+                key=f"sidebar_track_{subject}",
+                use_container_width=True,
+                type="primary" if selected else "secondary",
+                disabled=selected,
+            ):
+                if exists:
+                    st.session_state.active_track = subject
+                    st.session_state.current_view = "home"
+                    st.session_state.last_result = None
+                    st.session_state.resource_bundle = None
+                    st.rerun()
+                else:
+                    st.session_state.pending_add_subject = subject
+                    st.session_state.current_view = "add_track"
+                    st.rerun()
+
+        if st.button("+ Add track", key="sidebar_add_track", use_container_width=True):
+            st.session_state.pending_add_subject = subjects[0] if subjects else None
+            st.session_state.current_view = "add_track"
+            st.rerun()
+
+        st.markdown('<div class="nav-label">MAIN</div>', unsafe_allow_html=True)
+        for view_id, label in NAV:
+            active = st.session_state.current_view == view_id
+            if st.button(
+                label,
+                key=f"sidebar_nav_{view_id}",
+                use_container_width=True,
+                type="primary" if active else "secondary",
+            ):
+                st.session_state.current_view = view_id
+                st.rerun()
+
+        st.markdown('<div class="nav-label nav-label-plan">PLAN</div>', unsafe_allow_html=True)
+        view_id, label = PLAN_NAV
+        active = st.session_state.current_view == view_id
+        if st.button(
+            label,
+            key=f"sidebar_nav_{view_id}",
+            use_container_width=True,
+            type="primary" if active else "secondary",
+        ):
+            st.session_state.current_view = view_id
+            st.rerun()
+
+        if learner:
+            streak_card(getattr(learner, "activity_streak", {}))
+
+
+def get_current_view():
+    initialize_navigation()
+    return st.session_state.current_view

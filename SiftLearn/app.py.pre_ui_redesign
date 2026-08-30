@@ -1,0 +1,1072 @@
+import html
+
+import streamlit as st
+
+from core.orchestrator import SiftOrchestrator
+from ui import inject_css
+from ui.components import (
+    page_header, metric_card, mastery_bar, focus_card, task_card,
+    empty_card, resource_card, track_visual, today_session_card
+)
+from ui.sidebar import render_sidebar, get_current_view
+from ui.home import render_home
+
+st.set_page_config(
+    page_title="Sift — Adaptive Learning",
+    page_icon="S",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+inject_css()
+
+@st.cache_resource
+def get_orchestrator():
+    return SiftOrchestrator()
+
+sift = get_orchestrator()
+
+
+def esc(value):
+    return html.escape("" if value is None else str(value))
+
+# -------------------------------------------------------------------
+# Session state
+# -------------------------------------------------------------------
+
+DEFAULTS = {
+    "current_view": "home",
+    "active_track": None,
+    "track_profiles": {},
+    "track_setup": {},
+    "last_result": None,
+    "resource_bundle": None,
+    "answer_box": "",
+}
+for key, value in DEFAULTS.items():
+    st.session_state.setdefault(key, value)
+
+
+# -------------------------------------------------------------------
+# Backend compatibility helpers
+# -------------------------------------------------------------------
+
+def get_supported_subjects():
+    return list(sift.get_supported_subjects())
+
+
+def track_description(subject):
+    """Return the user-facing description for a supported learning track."""
+    descriptions = {
+        "Python": "Build programming fluency through hands-on practice.",
+        "Data Structures & Algorithms": (
+            "Master data structures and algorithmic thinking."
+        ),
+        "Machine Learning": (
+            "Learn ML concepts and build intelligent systems."
+        ),
+        "Mathematics": (
+            "Strengthen mathematical foundations and problem-solving."
+        ),
+    }
+    return descriptions.get(
+        subject,
+        "Adaptive learning for this supported track.",
+    )
+
+
+def get_track_profile(subject):
+    profiles = st.session_state.track_profiles
+    return profiles.get(subject)
+
+
+def remember_track(subject, learner_id):
+    st.session_state.track_profiles[subject] = learner_id
+
+
+def create_or_restore_track(subject, minutes, days, level, goal, name):
+    """
+    Each subject gets its own persisted learner/session state.
+
+    The existing orchestrator remains the source of truth. We do not
+    create a fake in-memory progress model for the learning engine.
+    """
+    learner_id, _ = sift.get_or_create_learner(
+        name=name.strip(),
+        goal=goal.strip(),
+        subject=subject,
+        available_minutes=int(minutes),
+        current_level=level,
+        target_days=int(days),
+    )
+    sift.create_session(learner_id, subject=subject)
+    remember_track(subject, learner_id)
+    return learner_id
+
+
+def ensure_active_track():
+    subject = st.session_state.active_track
+    if subject:
+        return subject
+
+    profiles = st.session_state.track_profiles
+    if profiles:
+        subject = next(iter(profiles.keys()))
+        st.session_state.active_track = subject
+        return subject
+
+    return None
+
+
+def get_active_session():
+    subject = ensure_active_track()
+    if not subject:
+        return None
+
+    learner_id = get_track_profile(subject)
+    if not learner_id:
+        return None
+
+    return sift.get_session(learner_id)
+
+
+def get_active_learner():
+    session = get_active_session()
+    return session.learner if session else None
+
+
+def today_minutes_(learner):
+    """Return actual active-learning minutes recorded for today."""
+    if learner is None:
+        return 0.0
+    state = getattr(learner, "activity_streak", {}) or {}
+    today = __import__("datetime").datetime.now().astimezone().date().isoformat()
+    return float((state.get("daily_minutes", {}) or {}).get(today, 0) or 0)
+
+
+def recommendation_for(session):
+    if session is None:
+        return None
+
+    try:
+        return session.engine.recommend(
+            learner=session.learner,
+            concepts=list(session.concepts.values()),
+            focus_concept=getattr(session, "focus_concept", None),
+        )
+    except Exception as exc:
+        st.session_state["recommendation_error"] = str(exc)
+        return None
+
+
+def active_task_from_session(session):
+    """Return one clean learner-facing task from the active backend intervention."""
+    active = getattr(session, "active_intervention", None)
+    if not isinstance(active, dict):
+        return None
+
+    candidates = (
+        active.get("intervention"),
+        active.get("task"),
+        active,
+    )
+    task = next(
+        (candidate for candidate in candidates if isinstance(candidate, dict)),
+        None,
+    )
+    if task is None:
+        return None
+
+    task = dict(task)
+
+    for key in (
+        "strategy", "concept", "title", "question", "action",
+        "target_concept", "difficulty", "question_type",
+    ):
+        if key not in task and key in active:
+            task[key] = active[key]
+
+    question = task.get("question") or task.get("task")
+    if not question:
+        return None
+
+    task["question"] = question
+    return task
+
+
+def is_diagnostic(recommendation):
+    return bool(
+        recommendation
+        and recommendation.get("action") == "diagnostic"
+    )
+
+
+def diagnostic_question(subject):
+    questions = {
+        "Python": (
+            "Explain the difference between a list and a tuple in Python. "
+            "Give one situation where you would choose each."
+        ),
+        "Data Structures & Algorithms": (
+            "Explain the difference between a stack and a queue. "
+            "Give one real-world or programming example of each."
+        ),
+        "Machine Learning": (
+            "Explain the difference between training data and test data, "
+            "and why a model should not be evaluated only on training data."
+        ),
+        "Mathematics": (
+            "Explain what it means for a function to be increasing on an interval. "
+            "Give a simple example."
+        ),
+    }
+    return questions.get(
+        subject,
+        "Explain one important concept from this subject in your own words and give an example.",
+    )
+
+
+def show_generation_error(exc):
+    message = str(exc or "")
+    low = message.lower()
+
+    if (
+        "429" in low
+        or "resource_exhausted" in low
+        or "quota" in low
+        or "rate limit" in low
+    ):
+        st.warning(
+            "Sift's AI task generator is temporarily rate-limited. "
+            "Your learning data is safe; try again shortly."
+        )
+    elif (
+        "no content model" in low
+        or "api key" in low
+        or "not configured" in low
+    ):
+        st.error(
+            "Sift's AI task generator is not configured correctly. "
+            "Check the Gemini configuration."
+        )
+    elif (
+        "novel" in low
+        or "contentvalidation" in low
+        or "valid novel" in low
+    ):
+        st.warning(
+            "Sift generated content that did not pass its learning-quality "
+            "checks, so it was not shown."
+        )
+    else:
+        st.error(
+            "Sift could not generate a valid learning task right now."
+        )
+
+    with st.expander("Technical details"):
+        st.code(message or "No additional details were returned.")
+
+
+def show_completion_error(exc):
+    message = str(exc or "")
+    low = message.lower()
+
+    if (
+        "429" in low
+        or "resource_exhausted" in low
+        or "quota" in low
+    ):
+        st.warning(
+            "Sift's AI evaluator is temporarily rate-limited. "
+            "Your learning state is safe."
+        )
+    else:
+        st.error("Sift could not complete this learning turn.")
+
+    with st.expander("Technical details"):
+        st.code(message or "No additional details were returned.")
+
+
+# -------------------------------------------------------------------
+# FIRST-RUN / TRACK SELECTION
+# -------------------------------------------------------------------
+
+subjects = get_supported_subjects()
+
+if not subjects:
+    st.error("No supported learning tracks are available from the backend.")
+    st.stop()
+
+active_subject = ensure_active_track()
+
+# First run: create a clean track-selection workspace.
+if active_subject is None:
+    st.markdown(
+        '<div class="onboarding-shell">'
+        '<div class="onboarding-copy">'
+        '<div class="home-eyebrow">SIFT · ADAPTIVE LEARNING</div>'
+        '<div class="onboarding-title">Learn smarter.<br><span>Grow stronger.</span></div>'
+        '<div class="onboarding-text">Sift adapts to you in real time, guiding you toward mastery with every useful learning signal.</div>'
+        '<div class="onboarding-points">'
+        '<div><b>Adaptive</b><span>Personalized learning that adjusts to you.</span></div>'
+        '<div><b>Focused</b><span>Concentrate on what matters most.</span></div>'
+        '<div><b>Measurable</b><span>See real progress you can track.</span></div>'
+        '</div></div>'
+        '<div class="onboarding-art" aria-hidden="true"><div class="onboard-glow"></div><div class="onboard-node n1">⌘</div><div class="onboard-node n2">&lt;/&gt;</div><div class="onboard-node n3">∑</div></div>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown('<div class="onboarding-form-title">Start with one learning path</div>', unsafe_allow_html=True)
+    if "first_track_subject" not in st.session_state:
+        st.session_state.first_track_subject = subjects[0]
+    cols = st.columns(len(subjects))
+    for col, subject in zip(cols, subjects):
+        with col:
+            selected = subject == st.session_state.first_track_subject
+            if st.button(("✓ " if selected else "") + subject, key=f"first_subject_{subject}", use_container_width=True, type="primary" if selected else "secondary"):
+                st.session_state.first_track_subject = subject
+                st.rerun()
+    selected_subject = st.session_state.first_track_subject
+    with st.form("create_first_track"):
+        name = st.text_input("Your name", placeholder="e.g. Alex")
+        goal = st.text_input("Learning goal (optional)", placeholder="e.g. exam, interview, project, or curiosity")
+        level = st.selectbox("Current level", ["Beginner", "Intermediate", "Advanced"])
+        st.markdown('<div class="setup-note"><b>No setup marathon.</b> Sift handles pacing automatically. You can adjust your study plan later.</div>', unsafe_allow_html=True)
+        submitted = st.form_submit_button(f"Start learning {selected_subject} →", type="primary", use_container_width=True)
+    if submitted:
+        if not name.strip():
+            st.error("Enter your name to continue.")
+        else:
+            try:
+                with st.spinner("Creating your adaptive learning path..."):
+                    learner_id = create_or_restore_track(selected_subject, 30, 30, level, goal, name)
+                    st.session_state.active_track = selected_subject
+                    st.session_state.current_view = "home"
+                    st.rerun()
+            except Exception as exc:
+                st.error("Sift could not create this learning track.")
+                with st.expander("Technical details"): st.code(str(exc))
+    st.stop()
+
+
+# -------------------------------------------------------------------
+# GLOBAL SIDEBAR
+# -------------------------------------------------------------------
+
+active_learner = get_active_learner()
+render_sidebar(
+    learner=active_learner,
+    subjects=subjects,
+    active_subject=active_subject,
+    track_profiles=st.session_state.track_profiles,
+)
+
+view = get_current_view()
+
+
+# -------------------------------------------------------------------
+# TRACK SWITCHER / ADD TRACK
+# -------------------------------------------------------------------
+
+def render_track_switcher():
+    st.markdown(
+        '<div class="section-title compact">My learning tracks</div>',
+        unsafe_allow_html=True,
+    )
+
+    cols = st.columns(len(subjects))
+
+    for col, subject in zip(cols, subjects):
+        profile_exists = subject in st.session_state.track_profiles
+        selected = subject == st.session_state.active_track
+
+        with col:
+            card_class = "track-card selected" if selected else "track-card"
+            status = "Active" if selected else ("Continue" if profile_exists else "Add track")
+            mastery = "—"
+
+            if profile_exists:
+                try:
+                    profile = sift.get_session(
+                        st.session_state.track_profiles[subject]
+                    )
+                    concepts = getattr(profile, "concepts", {}) or {}
+                    values = [
+                        float(getattr(c, "mastery", 0) or 0)
+                        for c in concepts.values()
+                    ]
+                    if values:
+                        mastery = f"{sum(values) / len(values):.0f}%"
+                except Exception:
+                    mastery = "—"
+
+            st.markdown(
+                f'<div class="{card_class}">'
+                f'<div class="track-visual">{track_visual(subject)}</div>'
+                f'<div class="track-name">{subject}</div>'
+                f'<div class="track-desc">{track_description(subject)}</div>'
+                f'<div class="track-bottom"><span class="badge blue">{status}</span>'
+                f'<span class="track-mastery">{mastery}</span></div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+            button_label = (
+                "Selected"
+                if selected
+                else ("Switch to track" if profile_exists else "Add track")
+            )
+
+            if st.button(
+                button_label,
+                key=f"track_switch_{subject}",
+                use_container_width=True,
+                disabled=selected,
+            ):
+                if profile_exists:
+                    st.session_state.active_track = subject
+                    st.session_state.last_result = None
+                    st.session_state.resource_bundle = None
+                    st.session_state.current_view = "home"
+                    st.rerun()
+                else:
+                    st.session_state["pending_add_subject"] = subject
+                    st.session_state["add_track_subject"] = subject
+                    st.session_state.current_view = "add_track"
+                    st.rerun()
+
+
+# -------------------------------------------------------------------
+# HOME
+# -------------------------------------------------------------------
+
+if view == "home":
+    learner = get_active_learner()
+    session = get_active_session()
+    recommendation = recommendation_for(session)
+
+    render_home(
+        sift=sift,
+        subjects=subjects,
+        active_subject=active_subject,
+        track_profiles=st.session_state.track_profiles,
+        learner=learner,
+        session=session,
+        recommendation=recommendation,
+    )
+
+
+# -------------------------------------------------------------------
+# ADD TRACK
+# -------------------------------------------------------------------
+
+elif view == "add_track":
+    page_header("Learning tracks", "Add another path.", "Pick a subject first. The setup area changes immediately to show whether you should switch or create a new track.")
+    if "add_track_subject" not in st.session_state:
+        st.session_state.add_track_subject=st.session_state.get("pending_add_subject") or subjects[0]
+    cols=st.columns(len(subjects))
+    for col, subject in zip(cols,subjects):
+        with col:
+            selected=subject==st.session_state.add_track_subject; exists=subject in st.session_state.track_profiles
+            label=("✓ " if selected else "")+subject+(" · saved" if exists and not selected else "")
+            if st.button(label,key=f"add_path_subject_{subject}",use_container_width=True,type="primary" if selected else "secondary"):
+                st.session_state.add_track_subject=subject; st.session_state.pending_add_subject=subject; st.rerun()
+    selected=st.session_state.add_track_subject
+    st.markdown(f'<div class="hero-track-preview"><div class="hero-track-art">{track_visual(selected)}</div><div><div class="hero-track-title">{selected}</div><div class="hero-track-copy">{track_description(selected)}</div></div></div>',unsafe_allow_html=True)
+    if selected in st.session_state.track_profiles:
+        st.markdown('<div class="soft-info"><span class="info-dot">✓</span><span>This track already exists. Its mastery, history and adaptive state are preserved.</span></div>',unsafe_allow_html=True)
+        if st.button("Switch to this track →",type="primary",use_container_width=True):
+            st.session_state.active_track=selected; st.session_state.current_view="home"; st.session_state.pending_add_subject=None; st.rerun()
+    else:
+        learner=get_active_learner(); default_name=getattr(learner,"name",""); default_goal=getattr(learner,"goal","")
+        with st.form("add_track_form"):
+            name=st.text_input("Learner name",value=default_name); goal=st.text_input("Learning goal",value=default_goal)
+            level=st.selectbox("Current level for this track",["Beginner","Intermediate","Advanced"],index=1)
+            st.markdown('<div class="setup-note"><b>Pacing is handled by Sift.</b> Study-plan preferences can be changed later without interrupting learning.</div>', unsafe_allow_html=True)
+            add=st.form_submit_button(f"Add {selected} →",type="primary",use_container_width=True)
+        if add:
+            try:
+                with st.spinner(f"Creating your {selected} learning path..."):
+                    create_or_restore_track(selected,30,30,level,goal,name)
+                    st.session_state.active_track=selected; st.session_state.current_view="home"; st.session_state.pending_add_subject=None; st.rerun()
+            except Exception as exc:
+                st.error(f"Could not add {selected}.");
+                with st.expander("Technical details"): st.code(str(exc))
+
+
+# -------------------------------------------------------------------
+# LEARN
+# -------------------------------------------------------------------
+
+elif view == "learn":
+    learner = get_active_learner()
+    session = get_active_session()
+    recommendation = recommendation_for(session)
+
+    if st.session_state.get("learning_timer_subject") != active_subject:
+        st.session_state.learning_timer_subject = active_subject
+        st.session_state.learning_timer_started_at = __import__("time").time()
+
+    st.session_state.setdefault("dynamic_answer_nonce", 0)
+    st.session_state.setdefault("diagnostic_nonce", 0)
+
+    page_header(
+        "Adaptive session",
+        f"Learn {active_subject}.",
+        "One focused turn at a time. Your response becomes evidence for what Sift recommends next.",
+    )
+
+    active_task = active_task_from_session(session)
+    current_phase = "Try" if active_task else ("Check" if st.session_state.get("last_result") else "Learn")
+    from ui.components import session_header
+    session_header(
+        active_subject,
+        getattr(learner, "current_level", "Learning"),
+        current_phase,
+        elapsed=None,
+    )
+
+    # Time is evidence, not a countdown. The long-term daily target remains
+    # in the study plan; this screen shows actual time spent learning today.
+    active_task = active_task_from_session(session)
+    streak = getattr(learner, "activity_streak", {}) or {}
+    today = __import__("datetime").datetime.now().astimezone().date().isoformat()
+    actual_today = float((streak.get("daily_minutes", {}) or {}).get(today, 0) or 0)
+    from ui.components import session_timer
+    session_timer(st.session_state.get("learning_timer_started_at"), actual_today, 0)
+
+    # ---------------------------------------------------------------
+    # ACTIVE TASK = BACKEND SOURCE OF TRUTH
+    # ---------------------------------------------------------------
+    if active_task is not None:
+        task_card(active_task)
+
+        st.markdown(
+            '<div class="answer-label">YOUR ANSWER</div>',
+            unsafe_allow_html=True,
+        )
+
+        answer_key = (
+            f"dynamic_answer_box_{st.session_state.dynamic_answer_nonce}"
+        )
+
+        answer = st.text_area(
+            "Answer",
+            placeholder="Write your reasoning here.",
+            label_visibility="collapsed",
+            key=answer_key,
+        )
+
+        if st.button(
+            "Submit answer →",
+            type="primary",
+            use_container_width=True,
+            key="submit_active_dynamic",
+        ):
+            if not answer.strip():
+                st.warning("Write an answer before submitting.")
+            else:
+                try:
+                    with st.spinner(
+                        "Sift is evaluating your understanding and updating your learning state..."
+                    ):
+                        result = sift.complete_dynamic_task(
+                            learner_id=st.session_state.track_profiles[active_subject],
+                            question=active_task.get("question", ""),
+                            answer=answer.strip(),
+                        )
+
+                    # complete_dynamic_task() clears the backend intervention.
+                    st.session_state.last_result = result
+                    st.session_state.dynamic_answer_nonce += 1
+                    st.rerun()
+
+                except Exception as exc:
+                    show_completion_error(exc)
+
+    # ---------------------------------------------------------------
+    # NO ACTIVE TASK: diagnostic or next recommendation
+    # ---------------------------------------------------------------
+    else:
+        if is_diagnostic(recommendation):
+            question = diagnostic_question(active_subject)
+
+            focus_card(
+                "Build your baseline",
+                "Sift does not have enough evidence about this track yet. This short diagnostic establishes the first useful signal.",
+                recommendation.get("reason"),
+                "diagnostic",
+            )
+
+            st.markdown(
+                '<div class="section-title">Diagnostic check</div>',
+                unsafe_allow_html=True,
+            )
+
+            st.markdown(
+                f'<div class="task-card">'
+                f'<div class="task-kicker">DIAGNOSTIC · {active_subject}</div>'
+                f'<div class="task-title">Show Sift how you think.</div>'
+                f'<div class="task-question">{question}</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+            diagnostic_key = (
+                f"diagnostic_answer_{st.session_state.diagnostic_nonce}"
+            )
+
+            answer = st.text_area(
+                "Diagnostic answer",
+                placeholder="Explain your reasoning in your own words.",
+                label_visibility="collapsed",
+                key=diagnostic_key,
+            )
+
+            if st.button(
+                "Submit diagnostic →",
+                type="primary",
+                use_container_width=True,
+                key="submit_diagnostic",
+            ):
+                if not answer.strip():
+                    st.warning("Write an answer before submitting.")
+                else:
+                    try:
+                        with st.spinner(
+                            "Sift is mapping your current knowledge..."
+                        ):
+                            result = sift.assess(
+                                learner_id=st.session_state.track_profiles[active_subject],
+                                question=question,
+                                answer=answer.strip(),
+                            )
+
+                        st.session_state.last_result = result
+                        st.session_state.diagnostic_nonce += 1
+                        st.rerun()
+
+                    except Exception as exc:
+                        show_completion_error(exc)
+
+        elif recommendation:
+            concept = (
+                recommendation.get("concept")
+                or recommendation.get("target_concept")
+                or "Next concept"
+            )
+            strategy = recommendation.get("strategy") or "adaptive"
+            reason = (
+                recommendation.get("reason")
+                or recommendation.get("diagnosis")
+            )
+
+            focus_card(
+                concept,
+                f"Sift recommends a {str(strategy).replace('_', ' ')} approach based on your current knowledge state.",
+                reason,
+                strategy,
+            )
+
+            if st.button(
+                "Generate my focused task →",
+                type="primary",
+                use_container_width=True,
+                key="generate_first_task",
+            ):
+                try:
+                    with st.spinner(
+                        "Sift is designing a task from your current knowledge state..."
+                    ):
+                        # Generation activates the backend intervention.
+                        sift.generate_dynamic_task(
+                            learner_id=st.session_state.track_profiles[active_subject],
+                            recommendation=recommendation,
+                        )
+
+                    st.session_state.last_result = None
+                    st.session_state.dynamic_answer_nonce += 1
+                    st.rerun()
+
+                except Exception as exc:
+                    show_generation_error(exc)
+
+        else:
+            empty_card(
+                "Sift could not read the current recommendation",
+                "Your track is still safe. Try refreshing this view.",
+            )
+
+    # ---------------------------------------------------------------
+    # LATEST RESULT + EXPLICIT NEXT-TASK TRANSITION
+    # ---------------------------------------------------------------
+    result = st.session_state.get("last_result")
+
+    if result and active_task is None:
+        assessment = result.get("assessment", {}) or {}
+        concept_data = result.get("concept", {}) or {}
+
+        score = assessment.get("score")
+        gain = result.get("learning_gain")
+        mastery = concept_data.get("mastery")
+
+        st.markdown(
+            '<div class="section-title">Latest result</div>',
+            unsafe_allow_html=True,
+        )
+
+        c1, c2, c3 = st.columns(3)
+
+        with c1:
+            metric_card(
+                "Understanding",
+                f"{float(score):.0f}%" if score is not None else "—",
+                "Latest assessment",
+            )
+
+        with c2:
+            metric_card(
+                "Mastery",
+                f"{float(mastery):.0f}%" if mastery is not None else "—",
+                concept_data.get("name", "Current concept"),
+            )
+
+        with c3:
+            metric_card(
+                "Learning gain",
+                f"{float(gain):+.1f}" if gain is not None else "—",
+                "Change from this turn",
+            )
+
+        feedback = (
+            assessment.get("explanation")
+            or assessment.get("feedback")
+            or ""
+        )
+
+        if feedback:
+            st.markdown(
+                f'<div class="result-card">'
+                f'<div class="result-heading">'
+                f'<span class="result-dot"></span>Feedback'
+                f'</div>'
+                f'<div class="result-feedback">{feedback}</div>'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+
+        next_rec = (
+            result.get("next_recommendation")
+            or result.get("recommendation")
+        )
+
+        if next_rec:
+            next_concept = (
+                next_rec.get("concept")
+                or next_rec.get("target_concept")
+                or "Next concept"
+            )
+
+            st.markdown(
+                '<div class="section-title">What’s next?</div>',
+                unsafe_allow_html=True,
+            )
+
+            focus_card(
+                next_concept,
+                "Sift is using your latest evidence to choose the next useful step.",
+                next_rec.get("reason")
+                or next_rec.get("diagnosis"),
+                next_rec.get("strategy"),
+            )
+
+            if st.button(
+                "Continue with the next task →",
+                type="primary",
+                use_container_width=True,
+                key="continue_next_task",
+            ):
+                try:
+                    with st.spinner(
+                        "Sift is preparing a fresh task from your updated knowledge state..."
+                    ):
+                        sift.generate_dynamic_task(
+                            learner_id=st.session_state.track_profiles[active_subject],
+                            recommendation=next_rec,
+                        )
+
+                    st.session_state.last_result = None
+                    st.session_state.dynamic_answer_nonce += 1
+                    st.rerun()
+
+                except Exception as exc:
+                    show_generation_error(exc)
+
+
+# -------------------------------------------------------------------
+# PROGRESS
+# -------------------------------------------------------------------
+
+elif view == "progress":
+    learner = get_active_learner()
+    session = get_active_session()
+    concepts = getattr(session, "concepts", {}) or {}
+    streak = getattr(learner, "activity_streak", {}) or {}
+    today = __import__("datetime").datetime.now().astimezone().date()
+    daily = streak.get("daily_minutes", {}) or {}
+    week_minutes = sum(float(daily.get((today - __import__("datetime").timedelta(days=i)).isoformat(), 0) or 0) for i in range(7))
+    turns = sum(int((streak.get("daily_turns", {}) or {}).get((today - __import__("datetime").timedelta(days=i)).isoformat(), 0) or 0) for i in range(7))
+    values = [float(getattr(c, "mastery", 0) or 0) for c in concepts.values()]
+    overall = sum(values) / len(values) if values else 0.0
+    strong = sum(1 for c in concepts.values() if float(getattr(c, "mastery", 0) or 0) >= 70)
+
+    page_header("Progress overview", "Your progress", "See how your understanding is improving over time, not just how much you have completed.")
+
+    st.markdown('<div class="progress-hero">', unsafe_allow_html=True)
+    st.markdown(f'<div class="progress-kpi"><div class="progress-kpi-label">OVERALL MASTERY</div><div class="progress-kpi-value">{overall:.0f}%</div><div class="progress-kpi-note">{len(concepts)} concepts with evidence</div></div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="progress-kpi"><div class="progress-kpi-label">CONCEPTS STRENGTHENED</div><div class="progress-kpi-value">{strong}</div><div class="progress-kpi-note">Strong evidence in this track</div></div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="progress-kpi"><div class="progress-kpi-label">CHALLENGES COMPLETED</div><div class="progress-kpi-value">{turns}</div><div class="progress-kpi-note">Learning turns this week</div></div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="progress-kpi"><div class="progress-kpi-label">LEARNING TIME</div><div class="progress-kpi-value">{week_minutes/60:.1f}h</div><div class="progress-kpi-note">Actual active learning this week</div></div>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="analytics-grid">', unsafe_allow_html=True)
+    st.markdown('<div class="analytics-panel"><div class="analytics-title">Concept mastery</div><div class="analytics-copy">Where your current evidence is strongest.</div>', unsafe_allow_html=True)
+    ranked = sorted(concepts.items(), key=lambda item: float(getattr(item[1], "mastery", 0) or 0), reverse=True)
+    if ranked:
+        for name, data in ranked[:6]:
+            mastery_bar(name, getattr(data, "mastery", 0), getattr(data, "attempts", 0), getattr(data, "correct_attempts", 0))
+    else:
+        st.markdown('<div class="gold-empty">Complete a learning turn and Sift will start building your mastery map.</div>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    points = []
+    for i, (_, data) in enumerate(ranked[:7]):
+        points.append((i, float(getattr(data, "mastery", 0) or 0)))
+    if not points:
+        points = [(0, 10), (1, 12), (2, 15), (3, 18), (4, 20), (5, 23), (6, 25)]
+    max_y = max(100.0, max(v for _, v in points))
+    coords = []
+    circles = []
+    for i, value in points:
+        x = 8 + (i / max(1, len(points) - 1)) * 84
+        y = 92 - (value / max_y) * 78
+        coords.append(f"{x:.1f},{y:.1f}")
+        circles.append(f'<circle cx="{x:.1f}%" cy="{y:.1f}%" r="2.1"></circle>')
+    svg = f'<svg viewBox="0 0 100 100" preserveAspectRatio="none"><polyline points="{" ".join(coords)}"></polyline>{"".join(circles)}</svg>'
+    st.markdown(f'<div class="analytics-panel"><div class="analytics-title">Recent improvement</div><div class="analytics-copy">Your evidence is moving upward as you practice.</div><div class="improvement-chart">{svg}</div></div>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    st.markdown('<div class="soft-info"><span class="info-dot">↗</span><div><b>How Sift adapts:</b> observe evidence → diagnose gaps → teach → recheck → adapt the next challenge.</div></div>', unsafe_allow_html=True)
+
+
+# -------------------------------------------------------------------
+# STUDY PLAN
+# -------------------------------------------------------------------
+
+elif view == "study_plan":
+    learner = get_active_learner()
+    session = get_active_session()
+    current_target = int(getattr(learner, "available_minutes", 30) or 30)
+    target_options = [10, 20, 30, 45, 60]
+    pace_options = ["Flexible", "Steady", "Focused"]
+    current_pace = st.session_state.get("study_pace", "Flexible")
+
+    page_header("Study plan", "Plan your pace, then get back to learning.", "Planning preferences guide Sift. They never count as learning, and you never need to configure them before a session.")
+    st.markdown('<div class="study-plan-grid">', unsafe_allow_html=True)
+    st.markdown(f'<div class="plan-stat"><div class="plan-label">DAILY TARGET</div><div class="plan-value">{current_target} min</div><div class="plan-note">A gentle planning target, not a requirement.</div></div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="plan-stat"><div class="plan-label">PACE</div><div class="plan-value">{esc(current_pace)}</div><div class="plan-note">Sift adapts the actual session to your evidence.</div></div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="plan-stat"><div class="plan-label">RECOMMENDED FOCUS</div><div class="plan-value">{esc(getattr(session, "focus_concept", None) or "Next best learning step")}</div><div class="plan-note">Based on your current learner state.</div></div>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    with st.form("study_plan_form"):
+        target = st.selectbox("Daily target", target_options, index=target_options.index(current_target) if current_target in target_options else 2, format_func=lambda v: f"{v} min/day")
+        pace = st.selectbox("Pace", pace_options, index=pace_options.index(current_pace) if current_pace in pace_options else 0)
+        st.markdown('<div class="setup-note">Actual learning is separate. Only meaningful active learning changes progress and streak.</div>', unsafe_allow_html=True)
+        saved = st.form_submit_button("Save study plan →", type="primary", use_container_width=True)
+    if saved:
+        try:
+            learner.available_minutes = int(target)
+            if hasattr(learner, "target_days"):
+                learner.target_days = int(getattr(learner, "target_days", 30) or 30)
+            sift.repository.save_learner(st.session_state.track_profiles[active_subject], learner)
+            st.session_state.study_pace = pace
+            st.success("Study plan saved. Your learning evidence stays unchanged.")
+            st.rerun()
+        except Exception as exc:
+            st.error("Sift could not save your study plan.")
+            with st.expander("Technical details"): st.code(str(exc))
+
+    st.markdown("<div class='section-title'>Sift's current plan</div>", unsafe_allow_html=True)
+    plan = sift.build_study_plan(st.session_state.track_profiles[active_subject], available_minutes=current_target)
+    tasks = plan.get("tasks", []) if isinstance(plan, dict) else []
+    st.markdown('<div class="plan-breakdown">', unsafe_allow_html=True)
+    rows = [
+        ("Focus", "Master weak concepts and build application skills"),
+        ("Weekly goal", "5–6 focused learning sessions"),
+        ("How Sift adapts", "Based on your performance, we adjust difficulty, content, and review"),
+        ("You can change", "Your target and pace anytime"),
+    ]
+    for label, value in rows:
+        st.markdown(f'<div class="plan-row"><b>{esc(label)}</b><span>{esc(value)}</span></div>', unsafe_allow_html=True)
+    if tasks:
+        st.markdown(f'<div class="plan-row"><b>Today</b><span>{esc(" · ".join(str(t.get("concept", "Concept")) for t in tasks[:3]))}</span></div>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    streak = getattr(learner, "activity_streak", {}) or {}
+    today = __import__("datetime").datetime.now().astimezone().date().isoformat()
+    actual = float((streak.get("daily_minutes", {}) or {}).get(today, 0) or 0)
+    st.markdown(f'<div class="gold-panel" style="margin-top:11px"><div class="gold-panel-title">ACTUAL LEARNING TODAY</div><div class="gold-metric-value">{actual:.0f} min</div><div class="gold-metric-note">Only active learning counts toward your progress.</div></div>', unsafe_allow_html=True)
+
+
+# -------------------------------------------------------------------
+# RESOURCES
+# -------------------------------------------------------------------
+
+elif view == "library":
+    learner = get_active_learner()
+    recommendation = recommendation_for(get_active_session())
+
+    page_header(
+        "Resources",
+        "Help for what you are learning now.",
+        "Sift keeps resources small, relevant, and connected to the current learning gap — not a generic content library.",
+    )
+
+    concept = (
+        (recommendation or {}).get("concept")
+        or (recommendation or {}).get("target_concept")
+    )
+
+    if not concept:
+        empty_card(
+            "Nothing needs extra support yet",
+            "Start a learning turn first. When Sift finds a gap that a resource can help with, it will surface it here.",
+        )
+    else:
+        focus_card(
+            concept,
+            "Use this space when Sift thinks another explanation or representation could make the concept easier to understand.",
+            (recommendation or {}).get("reason"),
+            (recommendation or {}).get("strategy"),
+        )
+
+        st.markdown(
+            '<div class="resource-help-strip">'
+            '<span class="info-dot">?</span>'
+            '<div><b>Resources are an intervention, not another syllabus.</b><br>'
+            '<span>Learn in Sift first. Use an external resource when it adds a useful explanation, visual, or worked example — then return to Learn and recheck.</span></div>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
+        resource_col, learn_col = st.columns([3, 1])
+        with resource_col:
+            find_label = "Refresh targeted help →" if st.session_state.get("resource_bundle") else "Find targeted help →"
+            if st.button(
+                find_label,
+                type="primary",
+                use_container_width=True,
+                key="find_targeted_resources",
+            ):
+                try:
+                    with st.spinner("Sift is finding support for this exact learning gap..."):
+                        if hasattr(sift, "recommend_resources"):
+                            bundle = sift.recommend_resources(
+                                learner_id=st.session_state.track_profiles[active_subject],
+                                concept=concept,
+                                recommendation=recommendation,
+                            )
+                        else:
+                            bundle = sift.resource_engine.recommend(
+                                concept=concept,
+                                subject=active_subject,
+                                learner_level=getattr(learner, "current_level", "Beginner"),
+                                strategy=(recommendation or {}).get("strategy"),
+                                mistake_type=(recommendation or {}).get("mistake_type"),
+                                misconception=(recommendation or {}).get("misconception"),
+                            )
+                        st.session_state.resource_bundle = bundle
+                        st.rerun()
+                except Exception as exc:
+                    st.error("Sift could not load targeted help right now.")
+                    with st.expander("Technical details"):
+                        st.code(str(exc))
+        with learn_col:
+            if st.button("Back to Learn →", use_container_width=True, key="resources_back_to_learn"):
+                st.session_state.current_view = "learn"
+                st.rerun()
+
+        bundle = st.session_state.get("resource_bundle")
+
+        if bundle:
+            quick_tip = bundle.get("quick_tip") if isinstance(bundle, dict) else None
+            video = bundle.get("youtube") if isinstance(bundle, dict) else None
+
+            st.markdown('<div class="section-title">Sift can help you here</div>', unsafe_allow_html=True)
+
+            if quick_tip:
+                st.markdown(
+                    f'<div class="resource-teach-card">'
+                    f'<div class="focus-kicker">START HERE · IN SIFT</div>'
+                    f'<div class="focus-title" style="font-size:19px">{esc(quick_tip.get("title", "Quick explanation"))}</div>'
+                    f'<div class="focus-copy">{esc(quick_tip.get("body", ""))}</div>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
+            if video:
+                st.markdown('<div class="section-title">One vetted external resource</div>', unsafe_allow_html=True)
+                resource_card(video, featured=True)
+
+                st.markdown(
+                    '<div class="resource-next-step">'
+                    '<b>After using it</b><span>Return to Learn and try the concept again. Your new answer becomes fresh evidence for Sift.</span>'
+                    '</div>',
+                    unsafe_allow_html=True,
+                )
+
+            if not quick_tip and not video:
+                empty_card(
+                    "No extra resource was necessary",
+                    "Sift did not find an external resource that passed its quality gate. Continue in Learn — the teaching loop can work without an external link.",
+                )
+
+
+# -------------------------------------------------------------------
+# HISTORY
+# -------------------------------------------------------------------
+
+elif view == "history":
+    learner = get_active_learner()
+    page_header("History", f"Your {active_subject} learning record.", "Open any turn to see what you answered, how Sift evaluated it, what changed, and what happened next.")
+    records=list(reversed(getattr(learner,"learning_records",[]) or []))
+    if not records:
+        empty_card("Nothing here yet","Your completed learning turns will appear here.")
+    else:
+        for idx,record in enumerate(records):
+            concept=getattr(record,"concept","Concept")
+            strategy=str(getattr(record,"strategy","adaptive")).replace("_"," ").title()
+            pre=getattr(record,"pre_mastery",None); post=getattr(record,"post_mastery",None); gain=getattr(record,"learning_gain",None)
+            title=f"{concept} · {strategy}"
+            summary=f"{float(pre):.0f}% → {float(post):.0f}% mastery" if pre is not None and post is not None else "Learning evidence recorded"
+            with st.expander(f"{title} — {summary}", expanded=(idx==0)):
+                m1,m2,m3=st.columns(3)
+                with m1: metric_card("Mastery change", f"{float(gain):+.1f}" if gain is not None else "—", "This learning turn")
+                with m2: metric_card("Time", f"{float(getattr(record,'duration_seconds',0) or 0)/60:.1f} min", "Recorded learning time")
+                with m3: metric_card("Result", f"{float((getattr(record,'evaluation',{}) or {}).get('score',0)):.0f}%" if (getattr(record,'evaluation',{}) or {}).get('score') is not None else "—", "Assessment evidence")
+                question=getattr(record,"question",None)
+                answer=getattr(record,"answer",None)
+                evaluation=getattr(record,"evaluation",{}) or {}
+                if question: st.markdown(f"**What Sift asked**\n\n{question}")
+                if answer: st.markdown(f"**Your answer**\n\n{answer}")
+                if evaluation:
+                    st.markdown("**How Sift evaluated it**")
+                    st.write(evaluation.get("explanation") or evaluation.get("feedback") or "Evaluation recorded.")
+                    if evaluation.get("misconception"): st.warning(f"Misconception detected: {evaluation['misconception']}")
+                    if evaluation.get("mistake_type") and evaluation.get("mistake_type") != "none": st.caption(f"Evidence type: {evaluation['mistake_type']}")
+                st.caption("Sift uses this evidence to update mastery and choose future practice; the latest answer is not the only signal.")
+
+st.caption(
+    f"Sift is currently focused on {active_subject}. "
+    "Other tracks keep their own learning state."
+)

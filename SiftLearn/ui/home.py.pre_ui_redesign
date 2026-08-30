@@ -1,0 +1,168 @@
+import streamlit as st
+from datetime import datetime, timedelta
+
+from ui.components import esc, track_visual
+
+DESCRIPTIONS = {
+    "Python": "Build programming fluency through hands-on practice.",
+    "Data Structures & Algorithms": "Master data structures and algorithmic thinking.",
+    "Machine Learning": "Learn ML concepts and build intelligent systems.",
+    "Mathematics": "Strengthen mathematical foundations and problem-solving.",
+}
+
+
+def _value(obj, key, default=None):
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _mastery(session):
+    concepts = _value(session, "concepts", {}) or {}
+    values = []
+    for concept in concepts.values():
+        try:
+            values.append(float(_value(concept, "mastery", 0) or 0))
+        except (TypeError, ValueError):
+            continue
+    return sum(values) / len(values) if values else 0.0
+
+
+def _today_stats(learner):
+    state = _value(learner, "activity_streak", {}) or {}
+    today = datetime.now().astimezone().date().isoformat()
+    minutes = float((state.get("daily_minutes", {}) or {}).get(today, 0) or 0)
+    turns = int((state.get("daily_turns", {}) or {}).get(today, 0) or 0)
+    concepts = list((state.get("daily_concepts", {}) or {}).get(today, []) or [])
+    return minutes, turns, len(concepts), state
+
+
+def _metric(label, value, note):
+    return (
+        '<div class="gold-metric">'
+        f'<div class="gold-metric-label">{esc(label)}</div>'
+        f'<div class="gold-metric-value">{esc(value)}</div>'
+        f'<div class="gold-metric-note">{esc(note)}</div>'
+        '</div>'
+    )
+
+
+def _next_step_visual():
+    """A compact decorative counterpart to the current adaptive recommendation."""
+    return (
+        '<div class="next-step-art" aria-hidden="true">'
+        '<span class="next-shadow"></span><span class="next-stack stack-one"></span>'
+        '<span class="next-stack stack-two"></span><span class="next-stack stack-three"></span>'
+        '<span class="next-stack stack-four"></span><span class="next-top"></span>'
+        '</div>'
+    )
+
+
+def _track_progress(sift, subject, learner_id):
+    if not learner_id:
+        return 0.0
+    try:
+        session = sift.get_session(learner_id)
+        return _mastery(session)
+    except Exception:
+        return 0.0
+
+
+def render_home(sift, subjects, active_subject, track_profiles, learner, session, recommendation=None):
+    minutes, turns, concepts_today, streak = _today_stats(learner)
+    current_streak = int(streak.get("current", 0) or 0)
+    name = str(_value(learner, "name", "Learner") or "Learner")
+    focus = _value(session, "focus_concept", None)
+
+    st.markdown(
+        '<div class="home-greeting">'
+        '<div class="home-eyebrow">HOME DASHBOARD</div>'
+        f'<h1>Good evening, {esc(name)}! 👋</h1>'
+        '<h2>Ready to continue your learning?</h2>'
+        '<p>Sift knows your next step, based on your progress.</p>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+
+    concept = (recommendation or {}).get("concept") or (recommendation or {}).get("target_concept")
+    reason = (recommendation or {}).get("reason") or (recommendation or {}).get("diagnosis")
+    description = (
+        "Your recent answers show you're ready to apply this concept to a new problem."
+        if concept else
+        "Give Sift one short learning signal and it will build your first useful path."
+    )
+    title = concept or "Build your baseline"
+
+    with st.container(border=True):
+        hero_copy, hero_art = st.columns((4, 1), gap="small", vertical_alignment="center")
+        with hero_copy:
+            st.markdown(
+                '<div class="home-next-card">'
+                '<div class="home-next-kicker">YOUR NEXT STEP</div>'
+                f'<div class="home-next-title">{esc(title)}</div>'
+                f'<div class="home-next-desc">{esc(description if not reason else reason)}</div>'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+            if st.button(
+                "Continue learning →" if concept else "Start learning →",
+                key="home_continue",
+                type="primary",
+            ):
+                st.session_state.current_view = "learn"
+                st.rerun()
+        with hero_art:
+            st.markdown(_next_step_visual(), unsafe_allow_html=True)
+
+    st.markdown(
+        '<div class="gold-metrics">'
+        + _metric("Learned today", f"{minutes:.0f} min", "Actual active learning")
+        + _metric("Learning turns", str(turns), "Completed evidence")
+        + _metric("Concepts strengthened", str(concepts_today), "Today")
+        + _metric("Streak", f"🔥 {current_streak} days", "Current streak")
+        + '</div>',
+        unsafe_allow_html=True,
+    )
+
+    progress_html = '<div class="gold-panel"><div class="gold-panel-head"><div class="gold-panel-title">TRACK PROGRESS</div><div class="gold-panel-link">This track</div></div>'
+    existing_subjects = [s for s in subjects if s in track_profiles]
+    for subject in existing_subjects[:4]:
+        value = _track_progress(sift, subject, track_profiles.get(subject))
+        visual = track_visual(subject)
+        progress_html += (
+            '<div class="gold-progress-row">'
+            f'<div class="gold-progress-head"><span class="gold-track-name"><span class="gold-track-icon">{visual}</span>{esc(subject)}</span><span>{value:.0f}%</span></div>'
+            f'<div class="gold-progress-track"><div class="gold-progress-fill" style="width:{value:.1f}%"></div></div>'
+            '</div>'
+        )
+    if not existing_subjects:
+        progress_html += '<div class="gold-empty">Add a learning track to begin building your progress.</div>'
+    elif not any(_track_progress(sift, subject, track_profiles.get(subject)) for subject in existing_subjects):
+        progress_html += '<div class="gold-empty">Complete your first learning turn to start building mastery.</div>'
+    progress_html += '</div>'
+
+    daily = streak.get("daily_minutes", {}) or {}
+    today = datetime.now().astimezone().date()
+    days = [today - timedelta(days=i) for i in range(6, -1, -1)]
+    values = [float(daily.get(d.isoformat(), 0) or 0) for d in days]
+    max_value = max(max(values), 10.0)
+    chart = '<div class="gold-panel"><div class="gold-panel-head"><div class="gold-panel-title">WEEKLY ACTIVITY</div><div class="gold-panel-link">This week</div></div><div class="gold-chart">'
+    for day, value in zip(days, values):
+        height = max(3, int((value / max_value) * 72))
+        chart += f'<div class="gold-bar"><b>{value:.0f}m</b><i style="height:{height}px"></i><span>{day.strftime("%a")}</span></div>'
+    chart += '</div>'
+    if not any(values):
+        chart += '<div class="gold-chart-empty">Your learning activity will appear here as you practice.</div>'
+    chart += '</div>'
+
+    progress_column, activity_column = st.columns(2, gap="small")
+    with progress_column:
+        st.markdown(progress_html, unsafe_allow_html=True)
+    with activity_column:
+        st.markdown(chart, unsafe_allow_html=True)
+
+    if focus:
+        st.markdown(
+            f'<div class="soft-info"><span class="info-dot">•</span><div><b>Current focus:</b> {esc(focus)} · your track state remains intact.</div></div>',
+            unsafe_allow_html=True,
+        )

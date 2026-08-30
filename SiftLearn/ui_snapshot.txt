@@ -1,0 +1,1976 @@
+﻿============================================================
+SIFT UI CODE SNAPSHOT
+============================================================
+
+==================== app.py ====================
+import streamlit as st
+
+from core.orchestrator import SiftOrchestrator
+from ui import (
+    inject_css,
+    brand,
+    metric_card,
+    progress_card,
+    tip_card,
+)
+
+
+st.set_page_config(
+    page_title="Sift â€” Adaptive Learning",
+    page_icon="ðŸ§ ",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+inject_css()
+
+
+@st.cache_resource
+def get_orchestrator():
+    return SiftOrchestrator()
+
+
+sift = get_orchestrator()
+
+
+# ---------------------------------------------------------------------------
+# Session state
+# ---------------------------------------------------------------------------
+
+defaults = {
+    "learner_id": None,
+    "page": "Home",
+    "last_result": None,
+    "onboarding_complete": False,
+}
+
+for key, value in defaults.items():
+    if key not in st.session_state:
+        st.session_state[key] = value
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def current_session():
+    if st.session_state.learner_id is None:
+        return None
+    return sift.get_session(st.session_state.learner_id)
+
+
+def current_learner():
+    session = current_session()
+    return session.learner if session else None
+
+
+def current_concepts():
+    session = current_session()
+    return list(session.concepts.values()) if session else []
+
+
+def get_recommendation():
+    session = current_session()
+    if not session:
+        return None
+    return session.engine.recommend(
+        learner=session.learner,
+        concepts=list(session.concepts.values()),
+    )
+
+
+def safe_float(value, default=0.0):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def mastery_average(concepts):
+    if not concepts:
+        return 0.0
+    return sum(safe_float(c.mastery) for c in concepts) / len(concepts)
+
+
+def latest_gain(learner):
+    records = getattr(learner, "learning_records", [])
+    if not records:
+        return 0.0
+    gain = getattr(records[-1], "learning_gain", 0)
+    return safe_float(gain)
+
+
+def strategy_name(strategy):
+    return str(strategy or "").replace("_", " ")
+
+
+def page_header(eyebrow, title, subtitle=""):
+    st.markdown(
+        f"""
+        <div class="sift-eyebrow">{eyebrow}</div>
+        <h1 style="margin-top:0">{title}</h1>
+        {"<div class='sift-hero-subtitle'>" + subtitle + "</div>" if subtitle else ""}
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Sidebar
+# ---------------------------------------------------------------------------
+
+with st.sidebar:
+    brand()
+
+    if st.session_state.learner_id is not None:
+        learner = current_learner()
+
+        st.caption("WORKSPACE")
+        page = st.radio(
+            "Navigation",
+            ["Home", "Learn", "Progress", "Resources", "History", "Profile"],
+            index=["Home", "Learn", "Progress", "Resources", "History", "Profile"].index(
+                st.session_state.page
+            ),
+            label_visibility="collapsed",
+        )
+        st.session_state.page = page
+
+        st.divider()
+
+        st.markdown(
+            f"""
+            <div class="sift-card soft" style="background:#171b24;border-color:#262c38">
+                <div class="sift-card-title" style="color:#8f98a9">Learner</div>
+                <div style="font-weight:700;margin-top:.35rem">{learner.name}</div>
+                <div style="color:#9da6b5;font-size:.8rem;margin-top:.2rem">
+                    {learner.subject}
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    else:
+        st.caption("GET STARTED")
+        st.markdown(
+            "Create your learning profile to unlock the adaptive workspace."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Onboarding
+# ---------------------------------------------------------------------------
+
+if st.session_state.learner_id is None:
+    st.markdown(
+        """
+        <div class="sift-hero">
+            <div class="sift-eyebrow">Adaptive learning</div>
+            <div class="sift-hero-title">Meet Sift.</div>
+            <div class="sift-hero-subtitle">
+                A learning coach that adapts to what you know, what you get wrong,
+                and which learning strategies actually help you improve.
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown('<div class="sift-section-label">Build your learning profile</div>',
+                unsafe_allow_html=True)
+
+    with st.form("profile_form"):
+        col1, col2 = st.columns(2)
+
+        with col1:
+            name = st.text_input("Your name", placeholder="e.g. Alex")
+            goal = st.text_input(
+                "Your goal",
+                placeholder="e.g. Prepare for an ML internship",
+            )
+
+        with col2:
+            subject = st.selectbox(
+                "Learning track",
+                [
+                    "Python",
+                    "Data Structures & Algorithms",
+                    "Machine Learning",
+                    "Mathematics",
+                ],
+            )
+            level = st.selectbox(
+                "Current level",
+                ["Beginner", "Intermediate", "Advanced"],
+            )
+
+        col3, col4 = st.columns(2)
+
+        with col3:
+            available_minutes = st.slider(
+                "Daily learning time",
+                min_value=5,
+                max_value=120,
+                value=20,
+                step=5,
+            )
+
+        with col4:
+            target_days = st.slider(
+                "Target timeline",
+                min_value=7,
+                max_value=180,
+                value=60,
+                step=1,
+            )
+
+        submitted = st.form_submit_button(
+            "Start learning with Sift â†’",
+            type="primary",
+            use_container_width=True,
+        )
+
+    if submitted:
+        if not name.strip():
+            st.error("Please enter your name.")
+        elif not goal.strip():
+            st.error("Please enter your learning goal.")
+        else:
+            with st.spinner("Setting up your adaptive workspace..."):
+                learner_id, _ = sift.get_or_create_learner(
+                    name=name.strip(),
+                    goal=goal.strip(),
+                    subject=subject,
+                    available_minutes=available_minutes,
+                    current_level=level,
+                    target_days=target_days,
+                )
+                sift.create_session(learner_id, subject=subject)
+                st.session_state.learner_id = learner_id
+                st.session_state.onboarding_complete = True
+                st.rerun()
+
+    st.stop()
+
+
+# ---------------------------------------------------------------------------
+# Main application
+# ---------------------------------------------------------------------------
+
+learner = current_learner()
+session = current_session()
+concepts = current_concepts()
+recommendation = get_recommendation()
+
+
+# ---------------------------------------------------------------------------
+# HOME
+# ---------------------------------------------------------------------------
+
+if st.session_state.page == "Home":
+    page_header(
+        "Learning workspace",
+        f"Good to see you, {learner.name}.",
+        "Sift is tracking what you know, where you're improving, and what to work on next.",
+    )
+
+    c1, c2, c3 = st.columns(3)
+
+    avg_mastery = mastery_average(concepts)
+
+    with c1:
+        metric_card(
+            "Current mastery",
+            f"{avg_mastery:.0f}%",
+            "Across tracked concepts",
+        )
+
+    with c2:
+        gain = latest_gain(learner)
+        metric_card(
+            "Last learning gain",
+            f"{gain:+.2f}",
+            "From your latest completed activity",
+        )
+
+    with c3:
+        records = getattr(learner, "learning_records", [])
+        metric_card(
+            "Learning sessions",
+            str(len(records)),
+            "Completed adaptive activities",
+        )
+
+    st.markdown('<div class="sift-section-label">Today</div>',
+                unsafe_allow_html=True)
+
+    left, right = st.columns([1.55, 1], gap="large")
+
+    with left:
+        if recommendation:
+            st.markdown(
+                f"""
+                <div class="focus-card">
+                    <div class="focus-kicker">Today's focus</div>
+                    <div class="focus-title">{recommendation.get("concept", "Next concept")}</div>
+                    <div class="focus-reason">
+                        {recommendation.get("reason", "Sift selected this based on your current learning state.")}
+                    </div>
+                    <div style="margin-top:1rem">
+                        <span class="chip red">{recommendation.get("action", "practice").title()}</span>
+                        <span class="chip" style="margin-left:.35rem">
+                            {strategy_name(recommendation.get("strategy", "adaptive")).title()}
+                        </span>
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            if st.button("Continue learning â†’", type="primary", use_container_width=True):
+                st.session_state.page = "Learn"
+                st.rerun()
+        else:
+            st.markdown(
+                """
+                <div class="empty-card">
+                    <div class="empty-title">Your adaptive path is ready</div>
+                    <div class="empty-text">
+                        Complete your first assessment to give Sift evidence about your knowledge.
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+    with right:
+        st.markdown(
+            """
+            <div class="sift-card">
+                <div class="sift-card-title">Your learning path</div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        if concepts:
+            for concept in sorted(concepts, key=lambda x: x.mastery):
+                progress_card(concept.name, concept.mastery)
+        else:
+            st.markdown(
+                '<div class="sift-card-caption">No concepts tracked yet.</div>',
+                unsafe_allow_html=True,
+            )
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown('<div class="sift-section-label">How Sift works</div>',
+                unsafe_allow_html=True)
+
+    h1, h2, h3 = st.columns(3)
+
+    with h1:
+        metric_card("01", "Measure", "Assess your understanding instead of assuming it.")
+
+    with h2:
+        metric_card("02", "Adapt", "Choose the next concept and strategy from your evidence.")
+
+    with h3:
+        metric_card("03", "Learn", "Generate a targeted activity and measure the gain.")
+
+# ---------------------------------------------------------------------------
+# LEARN
+# ---------------------------------------------------------------------------
+
+elif st.session_state.page == "Learn":
+    page_header(
+        "Adaptive session",
+        "Learn what Sift thinks you need next.",
+        "Every activity is generated from your current knowledge state.",
+    )
+
+    if session.active_intervention is None:
+        if not recommendation:
+            st.info("Sift needs an assessment before it can generate your next activity.")
+        else:
+            st.markdown(
+                f"""
+                <div class="sift-card">
+                    <div class="sift-card-title">Recommended activity</div>
+                    <div style="font-family:'Space Grotesk';font-size:1.55rem;font-weight:700;margin-top:.35rem">
+                        {recommendation.get("concept")}
+                    </div>
+                    <div class="sift-card-caption">
+                        {recommendation.get("reason", "Selected from your current learning state.")}
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+            if st.button("Generate my adaptive task â†’", type="primary"):
+                with st.spinner("Sift is designing a new task for you..."):
+                    try:
+                        result = sift.generate_dynamic_task(
+                            learner_id=st.session_state.learner_id,
+                            recommendation=recommendation,
+                        )
+                        st.session_state.last_result = result
+                        st.rerun()
+                    except Exception as exc:
+                        st.error("Sift couldn't generate the activity.")
+                        st.caption(str(exc))
+
+    else:
+        active = session.active_intervention
+        task = active.get("intervention", {})
+
+        st.markdown(
+            f"""
+            <div class="sift-card">
+                <div>
+                    <span class="chip red">{active.get("action", "practice").title()}</span>
+                    <span class="chip" style="margin-left:.35rem">
+                        {strategy_name(active.get("strategy", "adaptive")).title()}
+                    </span>
+                </div>
+                <div style="font-family:'Space Grotesk';font-size:1.65rem;font-weight:700;margin-top:.9rem">
+                    {task.get("title", "Adaptive task")}
+                </div>
+                <div class="sift-card-caption">
+                    {task.get("context", "")}
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        st.markdown('<div class="sift-section-label">Your challenge</div>',
+                    unsafe_allow_html=True)
+
+        st.markdown(task.get("question", ""), unsafe_allow_html=False)
+
+        answer = st.text_area(
+            "Your answer",
+            placeholder="Explain your reasoning or write your solution...",
+            height=180,
+            key="dynamic_answer",
+        )
+
+        if st.button("Submit answer â†’", type="primary", use_container_width=True):
+            if not answer.strip():
+                st.warning("Write an answer before submitting.")
+            else:
+                with st.spinner("Sift is assessing your response and updating your learning state..."):
+                    try:
+                        result = sift.complete_dynamic_task(
+                            learner_id=st.session_state.learner_id,
+                            question=task.get("question", ""),
+                            answer=answer.strip(),
+                        )
+                        st.session_state.last_result = result
+                        st.rerun()
+                    except Exception as exc:
+                        st.error("Sift couldn't complete this activity.")
+                        st.caption(str(exc))
+
+    if st.session_state.last_result and session.active_intervention is None:
+        result = st.session_state.last_result
+        assessment = result.get("assessment", {})
+        concept = result.get("concept", {})
+        gain = result.get("learning_gain", 0)
+
+        st.markdown('<div class="sift-section-label">What changed</div>',
+                    unsafe_allow_html=True)
+
+        r1, r2, r3 = st.columns(3)
+
+        with r1:
+            metric_card(
+                "Understanding",
+                f"{assessment.get('score', 0)}%",
+                "Latest assessment",
+            )
+
+        with r2:
+            metric_card(
+                "Learning gain",
+                f"{safe_float(gain):+.2f}",
+                "Change in estimated mastery",
+            )
+
+        with r3:
+            metric_card(
+                "Mastery",
+                f"{safe_float(concept.get('mastery')):.0f}%",
+                "Updated concept estimate",
+            )
+
+        if assessment.get("correct"):
+            st.success("Strong work â€” Sift recorded this as positive evidence.")
+        else:
+            st.warning(
+                assessment.get(
+                    "misconception",
+                    "Sift found an area that needs more practice.",
+                )
+            )
+
+        if assessment.get("explanation"):
+            tip_card(
+                "Sift's explanation",
+                assessment["explanation"],
+            )
+
+        next_rec = result.get("next_recommendation")
+        if next_rec:
+            st.markdown(
+                f"""
+                <div class="sift-card" style="margin-top:1rem">
+                    <div class="sift-card-title">Next adaptive decision</div>
+                    <div style="font-family:'Space Grotesk';font-size:1.25rem;font-weight:700;margin-top:.4rem">
+                        {next_rec.get("concept", "Next step")}
+                    </div>
+                    <div class="sift-card-caption">
+                        {next_rec.get("reason", "")}
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+# ---------------------------------------------------------------------------
+# PROGRESS
+# ---------------------------------------------------------------------------
+
+elif st.session_state.page == "Progress":
+    page_header(
+        "Progress",
+        "See how your knowledge is changing.",
+        "Mastery is Sift's estimate of knowledge, not simply your latest score.",
+    )
+
+    if not concepts:
+        st.markdown(
+            """
+            <div class="empty-card">
+                <div class="empty-title">No progress data yet</div>
+                <div class="empty-text">
+                    Complete a learning activity and Sift will start building your knowledge profile.
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    else:
+        avg = mastery_average(concepts)
+        records = getattr(learner, "learning_records", [])
+
+        a, b, c = st.columns(3)
+        with a:
+            metric_card("Average mastery", f"{avg:.0f}%", "Across tracked concepts")
+        with b:
+            metric_card("Activities", str(len(records)), "Completed learning records")
+        with c:
+            metric_card(
+                "Concepts tracked",
+                str(len(concepts)),
+                "Knowledge areas with evidence",
+            )
+
+        st.markdown('<div class="sift-section-label">Concept mastery</div>',
+                    unsafe_allow_html=True)
+
+        for concept in sorted(concepts, key=lambda x: x.mastery, reverse=True):
+            st.markdown(
+                f"""
+                <div class="sift-card" style="margin-bottom:.7rem;box-shadow:none">
+                    <div style="display:flex;justify-content:space-between;gap:1rem">
+                        <strong>{concept.name}</strong>
+                        <span>{concept.mastery:.0f}%</span>
+                    </div>
+                """,
+                unsafe_allow_html=True,
+            )
+            progress_card(concept.name, concept.mastery)
+            st.markdown(
+                f"""
+                    <div class="sift-card-caption">
+                        {concept.attempts} attempts Â· {concept.correct_attempts} strong attempts Â·
+                        {concept.confidence:.0f}% evidence confidence
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+# ---------------------------------------------------------------------------
+# RESOURCES
+# ---------------------------------------------------------------------------
+
+elif st.session_state.page == "Resources":
+    page_header(
+        "Resources",
+        "Useful help for the concept you're working on.",
+        "Sift can surface targeted explanations, tips, and vetted external resources.",
+    )
+
+    if recommendation:
+        concept_name = recommendation.get("concept", "your current concept")
+        st.markdown(
+            f"""
+            <div class="sift-card">
+                <div class="sift-card-title">Recommended topic</div>
+                <div style="font-family:'Space Grotesk';font-size:1.45rem;font-weight:700;margin-top:.4rem">
+                    {concept_name}
+                </div>
+                <div class="sift-card-caption">
+                    Resources should reinforce the exact concept rather than simply matching the subject.
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        tip_card(
+            "Use resources after thinking",
+            "Try the Sift activity first. Then use a short explanation or video to close the gap you discovered.",
+        )
+
+        st.info(
+            "Your resource engine is connected to the learning system. "
+            "Once its bundle is exposed through the UI, this page can render the vetted YouTube result and quick tip here."
+        )
+    else:
+        st.info("Complete an assessment to get concept-specific resources.")
+
+# ---------------------------------------------------------------------------
+# HISTORY
+# ---------------------------------------------------------------------------
+
+elif st.session_state.page == "History":
+    page_header(
+        "History",
+        "Your learning evidence.",
+        "Every completed activity contributes evidence to Sift's future decisions.",
+    )
+
+    records = list(reversed(getattr(learner, "learning_records", [])))
+
+    if not records:
+        st.markdown(
+            """
+            <div class="empty-card">
+                <div class="empty-title">Nothing here yet</div>
+                <div class="empty-text">
+                    Completed activities will appear here.
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+    else:
+        for record in records:
+            gain = safe_float(getattr(record, "learning_gain", 0))
+            st.markdown(
+                f"""
+                <div class="sift-card" style="margin-bottom:.7rem;box-shadow:none">
+                    <div style="display:flex;justify-content:space-between;gap:1rem">
+                        <div>
+                            <strong>{record.concept}</strong>
+                            <div class="sift-card-caption">
+                                {strategy_name(record.strategy).title()} Â·
+                                {getattr(record, "intervention_type", "learning").title()}
+                            </div>
+                        </div>
+                        <span class="chip green">+{gain:.2f}</span>
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+# ---------------------------------------------------------------------------
+# PROFILE
+# ---------------------------------------------------------------------------
+
+elif st.session_state.page == "Profile":
+    page_header(
+        "Profile",
+        "Your learning setup.",
+        "These preferences shape the adaptive experience.",
+    )
+
+    with st.form("profile_update"):
+        name = st.text_input("Name", value=learner.name)
+        goal = st.text_input("Goal", value=learner.goal)
+        subject = st.selectbox(
+            "Subject",
+            ["Python", "Data Structures & Algorithms", "Machine Learning", "Mathematics"],
+            index=["Python", "Data Structures & Algorithms", "Machine Learning", "Mathematics"].index(
+                learner.subject
+            ) if learner.subject in ["Python", "Data Structures & Algorithms", "Machine Learning", "Mathematics"] else 0,
+        )
+        level = st.selectbox(
+            "Level",
+            ["Beginner", "Intermediate", "Advanced"],
+            index=["Beginner", "Intermediate", "Advanced"].index(learner.current_level)
+            if learner.current_level in ["Beginner", "Intermediate", "Advanced"] else 0,
+        )
+
+        save = st.form_submit_button(
+            "Save profile",
+            type="primary",
+            use_container_width=True,
+        )
+
+    if save:
+        try:
+            learner_id, _ = sift.get_or_create_learner(
+                name=name.strip(),
+                goal=goal.strip(),
+                subject=subject,
+                available_minutes=learner.available_minutes,
+                current_level=level,
+                target_days=learner.target_days,
+            )
+            st.session_state.learner_id = learner_id
+            sift.create_session(learner_id, subject=subject)
+            st.success("Profile updated.")
+            st.rerun()
+        except Exception as exc:
+            st.error("Profile could not be updated.")
+            st.caption(str(exc))
+
+==================== ui\__init__.py ====================
+
+==================== ui\styles.py ====================
+import streamlit as st
+
+
+def load_styles():
+    st.markdown(
+        """
+        <style>
+
+        /* =====================================================
+           GLOBAL
+           ===================================================== */
+
+        .stApp {
+            background: #F7F8FA;
+            color: #172033;
+        }
+
+        .main .block-container {
+            max-width: 1440px;
+            padding: 32px 48px 64px 48px;
+        }
+
+        /* Remove Streamlit's default top padding */
+        header[data-testid="stHeader"] {
+            background: transparent;
+        }
+
+        /* =====================================================
+           TYPOGRAPHY
+           ===================================================== */
+
+        html,
+        body,
+        [class*="css"] {
+            font-family:
+                Inter,
+                -apple-system,
+                BlinkMacSystemFont,
+                "Segoe UI",
+                sans-serif;
+        }
+
+        h1, h2, h3, h4 {
+            color: #172033;
+            letter-spacing: -0.025em;
+        }
+
+        /* =====================================================
+           SIDEBAR
+           ===================================================== */
+
+        section[data-testid="stSidebar"] {
+            background: #FFFFFF;
+            border-right: 1px solid #E8EBF0;
+        }
+
+        section[data-testid="stSidebar"] > div {
+            padding: 24px 16px;
+        }
+
+        /* =====================================================
+           BUTTONS
+           ===================================================== */
+
+        .stButton > button {
+            border-radius: 10px;
+            border: 1px solid #E1E5EB;
+            min-height: 42px;
+            font-weight: 600;
+            transition:
+                transform 120ms ease,
+                box-shadow 120ms ease,
+                background 120ms ease;
+        }
+
+        .stButton > button:hover {
+            transform: translateY(-1px);
+            box-shadow:
+                0 4px 12px rgba(23, 32, 51, 0.08);
+        }
+
+        /* =====================================================
+           INPUTS
+           ===================================================== */
+
+        div[data-baseweb="input"] > div,
+        div[data-baseweb="select"] > div,
+        textarea {
+            border-radius: 9px !important;
+        }
+
+        /* =====================================================
+           DIVIDERS
+           ===================================================== */
+
+        hr {
+            border: none;
+            border-top: 1px solid #E8EBF0;
+            margin: 24px 0;
+        }
+
+        /* =====================================================
+           SIFT BRAND
+           ===================================================== */
+
+        .sift-brand {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 4px 8px 28px 8px;
+        }
+
+        .sift-logo {
+            width: 34px;
+            height: 34px;
+            border-radius: 10px;
+
+            display: flex;
+            align-items: center;
+            justify-content: center;
+
+            background:
+                linear-gradient(
+                    135deg,
+                    #FF5C7A,
+                    #FF8AA0
+                );
+
+            color: white;
+            font-size: 18px;
+            font-weight: 800;
+
+            box-shadow:
+                0 4px 12px rgba(255, 92, 122, 0.20);
+        }
+
+        .sift-name {
+            font-size: 19px;
+            font-weight: 750;
+            color: #172033;
+            letter-spacing: -0.03em;
+        }
+
+        .sift-tagline {
+            font-size: 10px;
+            color: #8A93A3;
+            margin-left: 2px;
+            margin-top: 1px;
+        }
+
+        /* =====================================================
+           PAGE HEADER
+           ===================================================== */
+
+        .page-eyebrow {
+            color: #8A93A3;
+            font-size: 12px;
+            font-weight: 700;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            margin-bottom: 8px;
+        }
+
+        .page-title {
+            color: #172033;
+            font-size: 34px;
+            line-height: 1.15;
+            font-weight: 750;
+            letter-spacing: -0.04em;
+            margin-bottom: 8px;
+        }
+
+        .page-subtitle {
+            color: #687386;
+            font-size: 15px;
+            line-height: 1.55;
+            max-width: 700px;
+        }
+
+        /* =====================================================
+           CARDS
+           ===================================================== */
+
+        .sift-card {
+            background: #FFFFFF;
+            border: 1px solid #E7EAF0;
+            border-radius: 14px;
+            padding: 22px;
+            box-shadow:
+                0 1px 2px rgba(23, 32, 51, 0.02);
+        }
+
+        .sift-card-title {
+            font-size: 13px;
+            font-weight: 700;
+            color: #687386;
+            margin-bottom: 8px;
+        }
+
+        .sift-card-value {
+            font-size: 30px;
+            font-weight: 750;
+            color: #172033;
+            letter-spacing: -0.04em;
+        }
+
+        .sift-card-caption {
+            color: #8A93A3;
+            font-size: 12px;
+            margin-top: 4px;
+        }
+
+        /* =====================================================
+           FOCUS CARD
+           ===================================================== */
+
+        .focus-card {
+            background: #FFFFFF;
+            border: 1px solid #E7EAF0;
+            border-radius: 16px;
+            padding: 28px;
+            box-shadow:
+                0 8px 24px rgba(23, 32, 51, 0.04);
+        }
+
+        .focus-label {
+            color: #FF5C7A;
+            font-size: 11px;
+            font-weight: 800;
+            text-transform: uppercase;
+            letter-spacing: 0.09em;
+            margin-bottom: 12px;
+        }
+
+        .focus-title {
+            color: #172033;
+            font-size: 25px;
+            font-weight: 750;
+            letter-spacing: -0.035em;
+        }
+
+        .focus-description {
+            color: #687386;
+            font-size: 14px;
+            line-height: 1.6;
+            margin-top: 8px;
+        }
+
+        /* =====================================================
+           PROGRESS
+           ===================================================== */
+
+        .progress-track {
+            width: 100%;
+            height: 8px;
+            background: #EEF0F4;
+            border-radius: 999px;
+            overflow: hidden;
+        }
+
+        .progress-fill {
+            height: 100%;
+            background: #FF5C7A;
+            border-radius: 999px;
+        }
+
+        .progress-row {
+            margin-bottom: 18px;
+        }
+
+        .progress-header {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 7px;
+        }
+
+        .progress-name {
+            color: #344054;
+            font-size: 13px;
+            font-weight: 650;
+        }
+
+        .progress-value {
+            color: #687386;
+            font-size: 12px;
+            font-weight: 650;
+        }
+
+        /* =====================================================
+           SIDEBAR USER
+           ===================================================== */
+
+        .sidebar-user {
+            border-top: 1px solid #E8EBF0;
+            margin-top: 24px;
+            padding: 18px 8px 4px 8px;
+        }
+
+        .sidebar-user-name {
+            color: #172033;
+            font-size: 13px;
+            font-weight: 700;
+        }
+
+        .sidebar-user-meta {
+            color: #8A93A3;
+            font-size: 11px;
+            margin-top: 3px;
+        }
+
+        /* =====================================================
+           RESPONSIVE
+           ===================================================== */
+
+        @media (max-width: 900px) {
+
+            .main .block-container {
+                padding:
+                    24px 22px 48px 22px;
+            }
+
+            .page-title {
+                font-size: 28px;
+            }
+
+        }
+
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+==================== ui\components.py ====================
+import streamlit as st
+
+
+def page_header(eyebrow, title, subtitle=None):
+    """
+    Render a consistent Sift page header.
+    """
+
+    eyebrow_html = ""
+
+    if eyebrow:
+        eyebrow_html = f"""
+        <div class="page-eyebrow">
+            {eyebrow}
+        </div>
+        """
+
+    subtitle_html = ""
+
+    if subtitle:
+        subtitle_html = f"""
+        <div class="page-subtitle">
+            {subtitle}
+        </div>
+        """
+
+    st.markdown(
+        f"""
+        {eyebrow_html}
+
+        <div class="page-title">
+            {title}
+        </div>
+
+        {subtitle_html}
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def metric_card(
+    title,
+    value,
+    caption=None,
+):
+    """
+    Render a compact dashboard metric.
+    """
+
+    caption_html = ""
+
+    if caption:
+        caption_html = f"""
+        <div class="sift-card-caption">
+            {caption}
+        </div>
+        """
+
+    st.markdown(
+        f"""
+        <div class="sift-card">
+
+            <div class="sift-card-title">
+                {title}
+            </div>
+
+            <div class="sift-card-value">
+                {value}
+            </div>
+
+            {caption_html}
+
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def focus_card(
+    concept,
+    description,
+    reason=None,
+):
+    """
+    Render today's adaptive learning recommendation.
+    """
+
+    reason_html = ""
+
+    if reason:
+        reason_html = f"""
+        <div
+            style="
+                margin-top:16px;
+                padding-top:14px;
+                border-top:1px solid #EEF0F4;
+                color:#687386;
+                font-size:13px;
+                line-height:1.55;
+            "
+        >
+            <strong style="color:#344054;">
+                Why Sift chose this
+            </strong>
+
+            <br>
+
+            {reason}
+        </div>
+        """
+
+    st.markdown(
+        f"""
+        <div class="focus-card">
+
+            <div class="focus-label">
+                Today's focus
+            </div>
+
+            <div class="focus-title">
+                {concept}
+            </div>
+
+            <div class="focus-description">
+                {description}
+            </div>
+
+            {reason_html}
+
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def mastery_bar(
+    concept,
+    mastery,
+):
+    """
+    Render a concept mastery progress bar.
+    """
+
+    try:
+        mastery_value = float(mastery)
+    except (
+        TypeError,
+        ValueError,
+    ):
+        mastery_value = 0.0
+
+    mastery_value = max(
+        0.0,
+        min(
+            100.0,
+            mastery_value,
+        ),
+    )
+
+    st.markdown(
+        f"""
+        <div class="progress-row">
+
+            <div class="progress-header">
+
+                <div class="progress-name">
+                    {concept}
+                </div>
+
+                <div class="progress-value">
+                    {mastery_value:.0f}%
+                </div>
+
+            </div>
+
+            <div class="progress-track">
+
+                <div
+                    class="progress-fill"
+                    style="width:{mastery_value:.1f}%"
+                ></div>
+
+            </div>
+
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def sidebar_brand():
+    """
+    Render the Sift brand inside the sidebar.
+    """
+
+    st.markdown(
+        """
+        <div class="sift-brand">
+
+            <div class="sift-logo">
+                S
+            </div>
+
+            <div>
+                <div class="sift-name">
+                    Sift
+                </div>
+
+                <div class="sift-tagline">
+                    ADAPTIVE LEARNING
+                </div>
+            </div>
+
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def sidebar_user(
+    name,
+    subject,
+    mastery=None,
+):
+    """
+    Render learner information at the bottom
+    of the sidebar.
+    """
+
+    mastery_html = ""
+
+    if mastery is not None:
+        try:
+            mastery_value = float(mastery)
+            mastery_html = (
+                f"{mastery_value:.0f}% mastery"
+            )
+        except (
+            TypeError,
+            ValueError,
+        ):
+            mastery_html = ""
+
+    meta_parts = [
+        str(subject) if subject else "",
+        mastery_html,
+    ]
+
+    meta = " â€¢ ".join(
+        part
+        for part in meta_parts
+        if part
+    )
+
+    st.markdown(
+        f"""
+        <div class="sidebar-user">
+
+            <div class="sidebar-user-name">
+                {name or "Learner"}
+            </div>
+
+            <div class="sidebar-user-meta">
+                {meta}
+            </div>
+
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+==================== ui\sidebar.py ====================
+import streamlit as st
+
+from ui.components import (
+    sidebar_brand,
+    sidebar_user,
+)
+
+
+# ============================================================
+# NAVIGATION
+# ============================================================
+
+NAV_ITEMS = [
+    ("home", "Home", "âŒ‚"),
+    ("learn", "Learn", "âœ¦"),
+    ("progress", "Progress", "â—’"),
+    ("library", "Library", "â–£"),
+    ("history", "History", "â†º"),
+]
+
+
+def initialize_navigation():
+    """
+    Initialize UI-only navigation state.
+
+    This function must not create an orchestrator,
+    call Gemini, query YouTube, or touch the database.
+    """
+
+    if "current_view" not in st.session_state:
+        st.session_state.current_view = "home"
+
+
+def render_sidebar(
+    learner=None,
+    overall_mastery=None,
+):
+    """
+    Render the complete Sift sidebar.
+
+    Navigation is handled entirely through Streamlit
+    session state.
+    """
+
+    initialize_navigation()
+
+    with st.sidebar:
+
+        # ----------------------------------------------------
+        # BRAND
+        # ----------------------------------------------------
+
+        sidebar_brand()
+
+        st.markdown(
+            """
+            <div
+                style="
+                    color:#98A2B3;
+                    font-size:10px;
+                    font-weight:700;
+                    letter-spacing:.08em;
+                    text-transform:uppercase;
+                    padding:0 8px 10px 8px;
+                "
+            >
+                Workspace
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        # ----------------------------------------------------
+        # NAVIGATION
+        # ----------------------------------------------------
+
+        for view_id, label, icon in NAV_ITEMS:
+
+            is_active = (
+                st.session_state.current_view
+                == view_id
+            )
+
+            if is_active:
+                button_type = "primary"
+            else:
+                button_type = "secondary"
+
+            if st.button(
+                f"{icon}   {label}",
+                key=f"nav_{view_id}",
+                use_container_width=True,
+                type=button_type,
+            ):
+                st.session_state.current_view = (
+                    view_id
+                )
+
+                # Force the app to rerender using
+                # the newly selected view.
+                st.rerun()
+
+        # ----------------------------------------------------
+        # SMALL DIVIDER
+        # ----------------------------------------------------
+
+        st.markdown(
+            """
+            <div
+                style="
+                    height:1px;
+                    background:#E8EBF0;
+                    margin:22px 8px 0 8px;
+                "
+            ></div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        # ----------------------------------------------------
+        # LEARNER SUMMARY
+        # ----------------------------------------------------
+
+        if learner is not None:
+
+            name = getattr(
+                learner,
+                "name",
+                None,
+            )
+
+            subject = getattr(
+                learner,
+                "subject",
+                None,
+            )
+
+            sidebar_user(
+                name=name,
+                subject=subject,
+                mastery=overall_mastery,
+            )
+
+        else:
+
+            sidebar_user(
+                name="Learner",
+                subject="",
+                mastery=overall_mastery,
+            )
+
+
+# ============================================================
+# CURRENT VIEW
+# ============================================================
+
+def get_current_view():
+    """
+    Return the currently selected UI view.
+    """
+
+    initialize_navigation()
+
+    return st.session_state.current_view
+
+==================== ui\home.py ====================
+import streamlit as st
+
+from ui.components import (
+    page_header,
+    metric_card,
+    focus_card,
+    mastery_bar,
+)
+
+
+def _get_value(obj, name, default=None):
+    """
+    Safely read an attribute from an object or key from a dict.
+    """
+
+    if obj is None:
+        return default
+
+    if isinstance(obj, dict):
+        return obj.get(name, default)
+
+    return getattr(obj, name, default)
+
+
+def _get_concepts(learner):
+    """
+    Safely extract concept history from the learner.
+    """
+
+    history = _get_value(
+        learner,
+        "concept_history",
+        {},
+    )
+
+    if not isinstance(history, dict):
+        return {}
+
+    return history
+
+
+def _get_overall_mastery(learner):
+    """
+    Calculate a lightweight overall mastery value.
+
+    This is UI-only aggregation. It does not modify
+    learner state or call the adaptive engine.
+    """
+
+    concepts = _get_concepts(learner)
+
+    values = []
+
+    for data in concepts.values():
+
+        if not isinstance(data, dict):
+            continue
+
+        mastery = data.get(
+            "current_mastery"
+        )
+
+        if mastery is None:
+            mastery = data.get(
+                "mastery"
+            )
+
+        try:
+            values.append(
+                float(mastery)
+            )
+        except (
+            TypeError,
+            ValueError,
+        ):
+            continue
+
+    if not values:
+        return 0.0
+
+    return sum(values) / len(values)
+
+
+def _get_focus(
+    recommendation,
+    learner,
+):
+    """
+    Convert the adaptive recommendation into
+    presentation-friendly data.
+
+    No recommendation is generated here.
+    """
+
+    if not isinstance(
+        recommendation,
+        dict,
+    ):
+        recommendation = {}
+
+    concept = (
+        recommendation.get(
+            "concept"
+        )
+        or recommendation.get(
+            "target_concept"
+        )
+    )
+
+    if not concept:
+
+        concepts = _get_concepts(
+            learner
+        )
+
+        if concepts:
+            concept = next(
+                iter(concepts)
+            )
+
+    if not concept:
+        concept = "Your next concept"
+
+    action = (
+        recommendation.get(
+            "action"
+        )
+        or "practice"
+    )
+
+    strategy = (
+        recommendation.get(
+            "strategy"
+        )
+        or "adaptive"
+    )
+
+    reason = (
+        recommendation.get(
+            "reason"
+        )
+    )
+
+    if reason:
+        description = reason
+    else:
+        description = (
+            "Sift has selected a focused "
+            f"{action} session using a "
+            f"{strategy.replace('_', ' ')} approach."
+        )
+
+    return (
+        concept,
+        description,
+        strategy,
+    )
+
+
+def _render_top_metrics(
+    overall_mastery,
+    learning_gain,
+    streak=None,
+):
+    """
+    Render dashboard metrics.
+    """
+
+    col1, col2, col3 = st.columns(
+        3,
+        gap="medium",
+    )
+
+    with col1:
+        metric_card(
+            title="Current mastery",
+            value=f"{overall_mastery:.0f}%",
+            caption="Across tracked concepts",
+        )
+
+    with col2:
+        metric_card(
+            title="Last learning gain",
+            value=(
+                f"+{learning_gain:.2f}"
+                if learning_gain is not None
+                else "â€”"
+            ),
+            caption="From your latest session",
+        )
+
+    with col3:
+        metric_card(
+            title="Learning streak",
+            value=(
+                f"{streak} days"
+                if streak is not None
+                else "â€”"
+            ),
+            caption="Keep the momentum going",
+        )
+
+
+def _render_concept_progress(
+    learner,
+):
+    """
+    Render the learner's strongest/current concepts.
+    """
+
+    concepts = _get_concepts(
+        learner
+    )
+
+    if not concepts:
+        st.markdown(
+            """
+            <div class="sift-card">
+                <div class="sift-card-title">
+                    Your progress
+                </div>
+
+                <div
+                    style="
+                        color:#687386;
+                        font-size:14px;
+                        line-height:1.6;
+                    "
+                >
+                    Complete your first learning session
+                    and Sift will start building your
+                    concept map.
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        return
+
+    st.markdown(
+        """
+        <div
+            style="
+                color:#172033;
+                font-size:18px;
+                font-weight:750;
+                letter-spacing:-.025em;
+                margin-bottom:16px;
+            "
+        >
+            Your progress
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # Show the most recently/strongly tracked concepts
+    # without making any backend calls.
+    shown = 0
+
+    for concept_name, data in concepts.items():
+
+        if not isinstance(data, dict):
+            continue
+
+        mastery = data.get(
+            "current_mastery"
+        )
+
+        if mastery is None:
+            mastery = data.get(
+                "mastery",
+                0,
+            )
+
+        mastery_bar(
+            concept=concept_name,
+            mastery=mastery,
+        )
+
+        shown += 1
+
+        if shown >= 5:
+            break
+
+
+def render_home(
+    learner,
+    recommendation=None,
+    learning_gain=None,
+    streak=None,
+):
+    """
+    Render the Sift Home dashboard.
+
+    Important performance rule:
+    this function only renders data already available
+    to the UI. It does NOT call Gemini, YouTube,
+    content generation, or the adaptive engine.
+    """
+
+    name = _get_value(
+        learner,
+        "name",
+        "there",
+    )
+
+    if not name:
+        name = "there"
+
+    overall_mastery = (
+        _get_overall_mastery(
+            learner
+        )
+    )
+
+    # --------------------------------------------------------
+    # HEADER
+    # --------------------------------------------------------
+
+    page_header(
+        eyebrow="Learning workspace",
+        title=f"Good to see you, {name}.",
+        subtitle=(
+            "Sift is keeping track of what you know, "
+            "where you're improving, and what to work "
+            "on next."
+        ),
+    )
+
+    st.markdown(
+        "<div style='height:20px'></div>",
+        unsafe_allow_html=True,
+    )
+
+    # --------------------------------------------------------
+    # METRICS
+    # --------------------------------------------------------
+
+    _render_top_metrics(
+        overall_mastery=overall_mastery,
+        learning_gain=learning_gain,
+        streak=streak,
+    )
+
+    st.markdown(
+        "<div style='height:28px'></div>",
+        unsafe_allow_html=True,
+    )
+
+    # --------------------------------------------------------
+    # TODAY'S FOCUS
+    # --------------------------------------------------------
+
+    concept, description, strategy = _get_focus(
+        recommendation,
+        learner,
+    )
+
+    left, right = st.columns(
+        [1.55, 1],
+        gap="large",
+    )
+
+    with left:
+
+        focus_card(
+            concept=concept,
+            description=description,
+            reason=(
+                "Recommended strategy: "
+                f"{strategy.replace('_', ' ')}"
+            ),
+        )
+
+        st.markdown(
+            "<div style='height:14px'></div>",
+            unsafe_allow_html=True,
+        )
+
+        if st.button(
+            "Continue learning â†’",
+            key="home_continue_learning",
+            type="primary",
+            use_container_width=True,
+        ):
+            st.session_state.current_view = (
+                "learn"
+            )
+            st.rerun()
+
+    with right:
+
+        st.markdown(
+            """
+            <div class="sift-card">
+
+                <div class="sift-card-title">
+                    Sift's approach
+                </div>
+
+                <div
+                    style="
+                        color:#172033;
+                        font-size:20px;
+                        font-weight:750;
+                        letter-spacing:-.03em;
+                        margin-bottom:10px;
+                    "
+                >
+                    Learn from your
+                    actual progress.
+                </div>
+
+                <div
+                    style="
+                        color:#687386;
+                        font-size:13px;
+                        line-height:1.65;
+                    "
+                >
+                    Every answer helps Sift understand
+                    your mastery and choose what should
+                    come next.
+                </div>
+
+                <div
+                    style="
+                        margin-top:18px;
+                        padding:12px 14px;
+                        border-radius:10px;
+                        background:#F8F9FB;
+                        color:#687386;
+                        font-size:12px;
+                        line-height:1.5;
+                    "
+                >
+                    Your next activity is based on
+                    your current learning state.
+                </div>
+
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    st.markdown(
+        "<div style='height:34px'></div>",
+        unsafe_allow_html=True,
+    )
+
+    # --------------------------------------------------------
+    # PROGRESS
+    # --------------------------------------------------------
+
+    _render_concept_progress(
+        learner
+    )
