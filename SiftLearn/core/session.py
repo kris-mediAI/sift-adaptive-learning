@@ -69,26 +69,6 @@ class SiftSession:
         self.session_history = []
 
     # ============================================================
-    # SESSION TIME BUDGET
-    # ============================================================
-
-    def completed_learning_seconds(self):
-        """Return persisted learning time already consumed by this session."""
-        total = 0
-        for record in getattr(self.learner, "learning_records", []) or []:
-            try:
-                total += max(0, int(getattr(record, "duration_seconds", 0) or 0))
-            except (TypeError, ValueError):
-                continue
-        return total
-
-    def remaining_learning_minutes(self):
-        """Return the approximate time budget still available for this session."""
-        budget = max(0, int(getattr(self.learner, "available_minutes", 30) or 30))
-        used = self.completed_learning_seconds() / 60.0
-        return max(0, round(budget - used, 1))
-
-    # ============================================================
     # CONCEPTS
     # ============================================================
 
@@ -246,6 +226,20 @@ class SiftSession:
 
         normalized_reported = normalize(reported)
 
+        # Dynamic tasks are scoped to the exact concept selected by the
+        # adaptive engine. If this answer is for the active generated task,
+        # the task target is authoritative even when the model uses a related
+        # or mistaken natural-language label. This prevents fresh learners
+        # from failing the validation boundary because they have no prior
+        # evidence for an alternative concept label.
+        active = self.active_intervention if isinstance(self.active_intervention, dict) else {}
+        active_task = active.get("intervention") if isinstance(active.get("intervention"), dict) else {}
+        active_question = str(active_task.get("question") or "").strip()
+        active_concept = str(active.get("concept") or "").strip()
+        if active.get("dynamic") and active_concept in graph and active_question and str(question).strip() == active_question:
+            assessment["concept"] = active_concept
+            return assessment
+
         # Canonicalize common multi-concept diagnostic labels before the
         # subject aliases. The assessment must still resolve to a node that
         # is actually registered in the learner graph.
@@ -399,6 +393,17 @@ class SiftSession:
 
         if best is not None and best_score >= 3:
             assessment["concept"] = best
+            return assessment
+
+        # A dynamic task is already scoped to one canonical concept. If the
+        # assessor uses a natural-language label that cannot be resolved, keep
+        # the evidence attached to that task's target instead of failing a
+        # fresh learner on an otherwise valid answer. This is only a fallback
+        # after all explicit graph/alias/question matching above has failed.
+        active = self.active_intervention if isinstance(self.active_intervention, dict) else {}
+        active_concept = str(active.get("concept") or self.focus_concept or "").strip()
+        if active_concept in graph:
+            assessment["concept"] = active_concept
 
         return assessment
 
@@ -422,7 +427,13 @@ class SiftSession:
         assessment = assess_answer(
             subject=subject,
             question=question,
-            answer=answer
+            answer=answer,
+            fallback_concept=(
+                self.focus_concept
+                or (
+                    self.active_intervention or {}
+                ).get("concept", "")
+            ),
         )
 
         assessment = self._canonicalize_assessment_concept(
@@ -721,7 +732,12 @@ class SiftSession:
         assessment = assess_answer(
             subject=subject,
             question=question,
-            answer=answer
+            answer=answer,
+            fallback_concept=(
+                active.get("concept", "")
+                if isinstance(active, dict)
+                else self.focus_concept
+            ),
         )
 
         assessment = self._canonicalize_assessment_concept(

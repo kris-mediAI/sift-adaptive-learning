@@ -59,13 +59,24 @@ def focus_card(concept, description, reason=None, strategy=None):
     )
 
 
+def _clean_task_text(value):
+    """Remove model/UI boundary artifacts without touching normal code syntax."""
+    text = str(value or "")
+    for artifact in (
+        "</div><div class=\"task-context\">",
+        "</div><div class='task-context'>",
+    ):
+        text = text.replace(artifact, "\n")
+    return text.replace("```</div>", "```")
+
+
 def task_card(task):
     task = task if isinstance(task, dict) else {}
     strategy = task.get("strategy") or task.get("intervention_type") or "adaptive"
     concept = task.get("concept") or "Current concept"
     title = task.get("title") or "Your learning task"
-    question = task.get("question") or task.get("task") or ""
-    context = task.get("context") or task.get("example") or ""
+    question = _clean_task_text(task.get("question") or task.get("task") or "")
+    context = _clean_task_text(task.get("context") or task.get("example") or "")
     guide = task.get("learning_guide") if isinstance(task.get("learning_guide"), dict) else {}
     explanation = str(guide.get("explanation") or "").strip()
     worked_example = str(guide.get("worked_example") or "").strip()

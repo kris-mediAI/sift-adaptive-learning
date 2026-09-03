@@ -13,7 +13,7 @@ checks={
  "result-first transition":"if result:" in text and "active_task(session)" in text,
  "no answer widget mutation":'st.session_state.answer_box = ""' not in text,
  "no diagnostic widget mutation":'st.session_state.diagnostic_answer = ""' not in text,
- "safe error path":"Sift could not evaluate this turn." in text,
+ "safe error path":"Sift couldn't evaluate that turn." in text,
 }
 for name,passed in checks.items(): print(("PASS " if passed else "FAIL ")+name)
 assert all(checks.values())

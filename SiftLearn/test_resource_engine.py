@@ -1,3 +1,4 @@
+import os
 from core.resource_engine import ResourceEngine
 
 
@@ -490,11 +491,9 @@ print("LIVE YOUTUBE TEST")
 print("=" * 70)
 
 
-if engine.youtube_api_key:
+if engine.youtube_api_key and os.getenv("SIFT_LIVE_YOUTUBE_TEST", "0") == "1":
 
-    print(
-        "YOUTUBE_API_KEY: FOUND"
-    )
+    print("YOUTUBE_API_KEY: FOUND; live test explicitly enabled")
 
     videos = engine.search_youtube(
         concept="modulo operator",
@@ -570,13 +569,11 @@ if engine.youtube_api_key:
 
 else:
 
-    print(
-        "YOUTUBE_API_KEY: NOT FOUND"
-    )
-
-    print(
-        "Live YouTube test skipped."
-    )
+    if engine.youtube_api_key:
+        print("YOUTUBE_API_KEY: FOUND; live test disabled by default.")
+    else:
+        print("YOUTUBE_API_KEY: NOT FOUND")
+    print("Live YouTube test skipped. Set SIFT_LIVE_YOUTUBE_TEST=1 to opt in.")
 
 
 # ================================================================

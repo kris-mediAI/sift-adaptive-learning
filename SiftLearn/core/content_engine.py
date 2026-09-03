@@ -217,7 +217,10 @@ class ContentEngine:
             "previous_tasks": previous_task_data,
         }
         if remaining_minutes is not None:
-            metadata["remaining_minutes"] = max(0.0, float(remaining_minutes))
+            try:
+                metadata["remaining_minutes"] = max(0.0, float(remaining_minutes))
+            except (TypeError, ValueError):
+                metadata["remaining_minutes"] = 0.0
 
         return TaskSpec(
             concept=concept.name,
@@ -264,7 +267,7 @@ class ContentEngine:
         previous_tasks=None,
         remaining_minutes=None,
     ):
-        """Generate one validated learning task within the remaining session budget."""
+        """Generate one validated learning task, with a safe offline fallback."""
         spec = self.build_task_spec(
             learner=learner,
             recommendation=recommendation,
@@ -404,12 +407,11 @@ STRICT RULES:
 19. Keep the task concise.
 20. Return ONLY valid JSON.
 21. Do not wrap JSON in Markdown code fences.
-22. If remaining session time is provided in the specification, scope the task and learning guide so the learner can reasonably complete this turn within that remaining budget.
-23. For very short remaining budgets, prefer one focused check or concise explanation rather than a multi-part lesson.
 22. Include a short learning guide before the task.
 23. The worked example MUST use different values/scenarios from the task.
 24. The learning guide must teach the concept, not merely describe the task.
 25. The guide must not reveal or imply the exact answer to the task.
+26. If remaining session time is provided, keep the task proportional to that time.
 
 For novel or transfer tasks, the previous tasks
 listed in the specification are examples that
@@ -847,6 +849,48 @@ Return ONLY valid JSON.
         ) < 5:
             raise ContentValidationError(
                 "Success signal is too short."
+            )
+
+        # Prevent a model from returning a structurally valid but semantically
+        # unrelated task (for example, an array-indexing question while the
+        # learner is explicitly working on recursion). A task only needs one
+        # meaningful concept signal because good questions may use synonyms or
+        # an application context instead of repeating the full concept name.
+        concept_text = str(spec.concept or "").lower()
+        task_text = " ".join(
+            str(task.get(field) or "")
+            for field in ("title", "question", "context", "success_signal")
+        ).lower()
+        concept_tokens = [
+            token for token in re.findall(r"[a-z0-9]+", concept_text)
+            if len(token) >= 4
+        ]
+        alias_tokens = {
+            "recursion": {"recursive", "recursion"},
+            "binary search": {"binary", "search"},
+            "linked lists": {"linked", "list", "lists"},
+            "data preparation": {"preparation", "preprocessing", "preprocess"},
+            "feature engineering": {"feature", "engineering"},
+            "machine learning": {"machine", "learning"},
+            "object oriented programming": {"object", "oriented", "oop"},
+        }.get(concept_text, set())
+        concept_signals = set(concept_tokens) | alias_tokens
+        task_tokens = set(re.findall(r"[a-z0-9]+", task_text))
+        normalized_task_tokens = set(task_tokens)
+        for token in list(task_tokens):
+            if len(token) > 4 and token.endswith("s"):
+                normalized_task_tokens.add(token[:-1])
+        signal_match = False
+        for token in concept_signals:
+            if token in normalized_task_tokens:
+                signal_match = True
+                break
+            if len(token) > 4 and token.endswith("s") and token[:-1] in normalized_task_tokens:
+                signal_match = True
+                break
+        if concept_signals and not signal_match:
+            raise ContentValidationError(
+                f"Generated task does not contain a meaningful signal for concept '{spec.concept}'."
             )
 
         forbidden = {

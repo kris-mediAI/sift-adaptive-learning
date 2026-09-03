@@ -130,7 +130,8 @@ def validate_assessment(result):
     }
 
 
-def assess_answer(subject, question, answer):
+def assess_answer(subject, question, answer, fallback_concept=""):
+
     """Analyze a student's answer and return trusted structured evidence."""
     if not str(subject).strip():
         raise ValueError("Assessment subject cannot be empty.")
@@ -153,6 +154,9 @@ Question:
 
 Student answer:
 {answer}
+
+Current target concept (use this as the assessment anchor when provided):
+{fallback_concept or "Use the concept most directly evidenced by the question."}
 
 Return ONLY valid JSON.
 
@@ -191,14 +195,76 @@ Rules:
     # do not need a live Gemini connection.
     from ai.gemini import generate
 
-    raw = generate(prompt)
-    raw = _strip_json_fences(raw)
+    def _parse_and_validate(raw_text):
+        cleaned = _strip_json_fences(raw_text)
+        try:
+            parsed = json.loads(cleaned)
+        except json.JSONDecodeError as error:
+            raise ValueError(
+                "Gemini returned invalid assessment JSON."
+            ) from error
+        return validate_assessment(parsed)
 
+    # Gemini occasionally returns malformed/truncated structured output even
+    # when the underlying request succeeds.  Treat that as a recoverable
+    # formatting failure: make one fresh, explicit JSON-repair request before
+    # surfacing an evaluation error to the learner.  The repaired response
+    # still has to pass the same strict validation boundary.
+    first_raw = None
     try:
-        result = json.loads(raw)
-    except json.JSONDecodeError as error:
-        raise ValueError(
-            "Gemini returned invalid assessment JSON."
-        ) from error
+        first_raw = generate(prompt)
+        return _parse_and_validate(first_raw)
+    except (ValueError, RuntimeError) as first_error:
+        repair_prompt = f"""
+You are repairing a structured assessment response for Sift.
 
-    return validate_assessment(result)
+Return ONLY one valid JSON object with exactly these fields:
+score, correct, concept, mistake_type, misconception, confidence,
+explanation, next_concept, strengths, gaps, recommended_help.
+
+Original assessment request:
+{prompt}
+
+Previous model output:
+{str(first_raw or first_error)[:12000]}
+
+Do not add markdown fences, commentary, or extra keys.
+Keep the assessment grounded in the student's question and answer.
+"""
+        try:
+            return _parse_and_validate(generate(repair_prompt))
+        except (ValueError, RuntimeError):
+            # A learner saying they do not know is itself valid evidence.
+            # If the AI service is temporarily unavailable, preserve the
+            # learning loop for this explicit low-information case instead
+            # of turning a transient infrastructure failure into a dead end.
+            # The session layer still canonicalizes/validates the concept
+            # against its registered graph before changing learner state.
+            uncertainty = {
+                "idk",
+                "i don't know",
+                "i dont know",
+                "don't know",
+                "dont know",
+                "not sure",
+                "no idea",
+                "i have no idea",
+                "skip",
+                "pass",
+            }
+            normalized_answer = " ".join(str(answer).strip().lower().split())
+            if fallback_concept and normalized_answer in uncertainty:
+                return validate_assessment({
+                    "score": 0,
+                    "correct": False,
+                    "concept": str(fallback_concept or "unknown").strip() or "unknown",
+                    "mistake_type": "prerequisite",
+                    "misconception": "The learner did not provide enough evidence to demonstrate the concept yet.",
+                    "confidence": 100,
+                    "explanation": "No problem — Sift will use this as a signal to slow down and teach the concept before checking again.",
+                    "next_concept": str(fallback_concept or "").strip(),
+                    "strengths": [],
+                    "gaps": ["demonstrating the current concept"],
+                    "recommended_help": "explanation",
+                })
+            raise first_error

@@ -62,6 +62,7 @@ from __future__ import annotations
 
 import os
 import re
+from urllib.parse import quote_plus
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 from dotenv import load_dotenv
@@ -121,6 +122,11 @@ class ResourceEngine:
     MIN_VIDEO_SCORE = 70
 
     MAX_YOUTUBE_RESULTS = 10
+
+    # A second, simpler query is used only when the focused query
+    # returns no acceptable videos. This improves recall for arbitrary
+    # learner-created topics without relaxing the relevance gate.
+    MAX_YOUTUBE_SEARCH_QUERIES = 2
 
     # ========================================================
     # EDUCATIONAL LANGUAGE
@@ -746,167 +752,118 @@ class ResourceEngine:
             ),
         )
 
-        youtube = (
-            self._get_youtube_client()
+        youtube = self._get_youtube_client()
+        queries = self._build_search_queries(
+            concept=concept,
+            subject=subject,
+            learner_level=learner_level,
+            strategy=strategy,
+            mistake_type=mistake_type,
+            misconception=misconception,
         )
 
-        query = (
-            self._build_search_query(
-                concept=concept,
-                subject=subject,
-                learner_level=learner_level,
-                strategy=strategy,
-                mistake_type=mistake_type,
-                misconception=misconception,
-            )
-        )
+        candidates: List[Dict[str, Any]] = []
+        seen_ids: Set[str] = set()
 
-        try:
-
-            response = (
-                youtube.search()
-                .list(
-                    part="snippet",
-                    q=query,
-                    type="video",
-                    maxResults=max_results,
-                    videoDuration="medium",
-                    videoEmbeddable="true",
-                    videoSyndicated="true",
-                    videoCaption="closedCaption",
-                    safeSearch="strict",
-                    relevanceLanguage="en",
-                    order="relevance",
+        for query in queries[: self.MAX_YOUTUBE_SEARCH_QUERIES]:
+            try:
+                response = (
+                    youtube.search()
+                    .list(
+                        part="snippet",
+                        q=query,
+                        type="video",
+                        maxResults=max_results,
+                        # Do not artificially exclude useful lectures/short
+                        # explainers just because of duration or caption flags.
+                        # The relevance gate below remains the real filter.
+                        videoDuration="any",
+                        videoEmbeddable="any",
+                        videoSyndicated="any",
+                        videoCaption="any",
+                        safeSearch="strict",
+                        relevanceLanguage="en",
+                        order="relevance",
+                    )
+                    .execute()
                 )
-                .execute()
-            )
+            except Exception as exc:
+                raise ResourceSearchError(
+                    f"YouTube search failed: {exc}"
+                ) from exc
 
-        except Exception as exc:
+            accepted_this_query = 0
 
-            raise ResourceSearchError(
-                f"YouTube search failed: {exc}"
-            ) from exc
-
-        candidates = []
-
-        for item in response.get(
-            "items",
-            [],
-        ):
-
-            video_id = (
-                item
-                .get(
-                    "id",
-                    {},
+            for item in response.get("items", []):
+                video_id = (
+                    item.get("id", {}).get("videoId")
                 )
-                .get(
-                    "videoId"
+                snippet = item.get("snippet", {})
+
+                if not video_id or video_id in seen_ids:
+                    continue
+
+                seen_ids.add(video_id)
+
+                title = snippet.get("title", "")
+                description = snippet.get("description", "")
+
+                score, reasons, rejected = self._score_video(
+                    title=title,
+                    description=description,
+                    concept=concept,
+                    subject=subject,
                 )
-            )
 
-            snippet = item.get(
-                "snippet",
-                {}
-            )
-
-            if not video_id:
-                continue
-
-            title = snippet.get(
-                "title",
-                "",
-            )
-
-            description = snippet.get(
-                "description",
-                "",
-            )
-
-            (
-                score,
-                reasons,
-                rejected,
-            ) = self._score_video(
-                title=title,
-                description=description,
-                concept=concept,
-                subject=subject,
-            )
-
-            candidates.append(
-                {
+                video = {
                     "type": "youtube",
-
                     "video_id": video_id,
-
                     "title": title,
-
                     "description": description,
-
-                    "channel": snippet.get(
-                        "channelTitle"
-                    ),
-
-                    "published_at": snippet.get(
-                        "publishedAt"
-                    ),
-
+                    "channel": snippet.get("channelTitle"),
+                    "published_at": snippet.get("publishedAt"),
                     "thumbnail": (
-                        snippet
-                        .get(
-                            "thumbnails",
-                            {}
-                        )
-                        .get(
-                            "high",
-                            {}
-                        )
-                        .get(
-                            "url"
-                        )
+                        snippet.get("thumbnails", {})
+                        .get("high", {})
+                        .get("url")
                     ),
-
                     "url": (
                         "https://www.youtube.com/watch?v="
                         + video_id
                     ),
-
                     "embed_url": (
                         "https://www.youtube.com/embed/"
                         + video_id
                     ),
-
                     "search_query": query,
-
                     "quality_score": score,
-
                     "quality_reasons": reasons,
-
                     "rejected": rejected,
                 }
-            )
+                candidates.append(video)
 
-        # ----------------------------------------------------
-        # Only accepted resources continue.
-        # ----------------------------------------------------
+                if not rejected and score >= self.MIN_VIDEO_SCORE:
+                    accepted_this_query += 1
+
+            # The focused query normally wins. Only broaden when it
+            # produced zero usable recommendations. This keeps results
+            # relevant instead of returning a random second-page video.
+            if accepted_this_query:
+                break
 
         accepted = [
             video
             for video in candidates
             if (
                 not video["rejected"]
-                and video["quality_score"]
-                >= self.MIN_VIDEO_SCORE
+                and video["quality_score"] >= self.MIN_VIDEO_SCORE
             )
         ]
 
         accepted.sort(
             key=lambda video: (
                 video["quality_score"],
-                self._educational_score(
-                    video
-                ),
+                self._educational_score(video),
             ),
             reverse=True,
         )
@@ -937,28 +894,26 @@ class ResourceEngine:
         )
 
         videos = []
+        resource_status = "ok"
+        resource_error = None
 
         try:
-
-            videos = (
-                self.search_youtube(
-                    concept=concept,
-                    subject=subject,
-                    learner_level=learner_level,
-                    strategy=strategy,
-                    mistake_type=mistake_type,
-                    misconception=misconception,
-                    max_results=10,
-                )
+            videos = self.search_youtube(
+                concept=concept,
+                subject=subject,
+                learner_level=learner_level,
+                strategy=strategy,
+                mistake_type=mistake_type,
+                misconception=misconception,
+                max_results=10,
             )
-
-        except (
-            ResourceConfigurationError,
-            ResourceSearchError,
-        ):
-
-            # External resources are optional.
-            videos = []
+        except ResourceConfigurationError as exc:
+            # Keep the learning flow alive, but do not hide the reason.
+            resource_status = "missing_api_key"
+            resource_error = str(exc)
+        except ResourceSearchError as exc:
+            resource_status = "search_failed"
+            resource_error = str(exc)
 
         best_video = (
             videos[0]
@@ -986,6 +941,16 @@ class ResourceEngine:
             "has_external_resource": (
                 best_video is not None
             ),
+
+            # Always provide a deterministic escape hatch when the API
+            # is unavailable. This is a topic-specific YouTube search,
+            # not a fake recommendation, and lets the learner continue.
+            "youtube_search_url": (
+                "https://www.youtube.com/results?search_query="
+                + quote_plus(str(concept).strip() + " tutorial explained")
+            ),
+            "youtube_status": resource_status,
+            "youtube_error": resource_error,
         }
 
     # ========================================================
@@ -1108,6 +1073,18 @@ class ResourceEngine:
             )
         )
 
+        # Arbitrary learner topics are often broader than the title of a
+        # useful video. For example, "Generative AI and LangChain" may have
+        # a strong result titled "LangChain Tutorial for Beginners". A
+        # distinctive component can recover that result without accepting
+        # generic words such as "tutorial" or "AI" by themselves.
+        title_component_matches = self._matching_concept_components(
+            title_text, concept
+        )
+        description_component_matches = self._matching_concept_components(
+            description_text, concept
+        )
+
         # ====================================================
         # SUBJECT SIGNALS
         # ====================================================
@@ -1193,6 +1170,39 @@ class ResourceEngine:
                 "strong concept alias appears in description"
             )
 
+        # ----------------------------------------------------
+        # Distinctive component match for arbitrary/composite
+        # concepts. Weaker than an exact phrase, but strong
+        # enough to recover legitimate topic-specific resources.
+        # ----------------------------------------------------
+
+        component_match_count = len(title_component_matches)
+        description_component_count = len(description_component_matches)
+
+        if (
+            component_match_count
+            and not exact_concept_in_title
+            and not exact_concept_in_description
+            and not title_concept_matches
+            and not description_concept_matches
+        ):
+            score += min(50, 50 + (component_match_count - 1) * 5)
+            reasons.append(
+                "distinctive concept component appears in title"
+            )
+
+        elif (
+            description_component_count
+            and not exact_concept_in_title
+            and not exact_concept_in_description
+            and not title_concept_matches
+            and not description_concept_matches
+        ):
+            score += min(50, 50 + (description_component_count - 1) * 5)
+            reasons.append(
+                "distinctive concept component appears in description"
+            )
+
         # ====================================================
         # SUBJECT
         # ====================================================
@@ -1231,16 +1241,14 @@ class ResourceEngine:
 
         has_title_concept = (
             exact_concept_in_title
-            or bool(
-                title_concept_matches
-            )
+            or bool(title_concept_matches)
+            or bool(title_component_matches)
         )
 
         has_description_concept = (
             exact_concept_in_description
-            or bool(
-                description_concept_matches
-            )
+            or bool(description_concept_matches)
+            or bool(description_component_matches)
         )
 
         if (
@@ -1261,12 +1269,10 @@ class ResourceEngine:
         has_concept_signal = (
             exact_concept_in_title
             or exact_concept_in_description
-            or bool(
-                title_concept_matches
-            )
-            or bool(
-                description_concept_matches
-            )
+            or bool(title_concept_matches)
+            or bool(description_concept_matches)
+            or bool(title_component_matches)
+            or bool(description_component_matches)
         )
 
         rejected = False
@@ -1420,6 +1426,33 @@ class ResourceEngine:
     # SEARCH QUERY
     # ========================================================
 
+    def _build_search_queries(
+        self,
+        concept: str,
+        subject: str,
+        learner_level: str,
+        strategy: Optional[str],
+        mistake_type: Optional[str],
+        misconception: Optional[str],
+    ) -> List[str]:
+        """Build a focused query plus one recall-oriented fallback."""
+        primary = self._build_search_query(
+            concept=concept,
+            subject=subject,
+            learner_level=learner_level,
+            strategy=strategy,
+            mistake_type=mistake_type,
+            misconception=misconception,
+        )
+
+        clean_concept = " ".join(str(concept).strip().split())
+        fallback = f'"{clean_concept}" tutorial explained'
+
+        queries = [primary]
+        if fallback.casefold() != primary.casefold():
+            queries.append(fallback)
+        return queries
+
     def _build_search_query(
         self,
         concept: str,
@@ -1436,11 +1469,17 @@ class ResourceEngine:
         the query because that can make searches noisy.
         """
 
+        # Put the learner's actual concept first. Subject and pedagogy are
+        # context, not search gates; this is important for arbitrary topics
+        # such as "Transformers attention" or "pandas groupby".
         parts = [
-            str(subject).strip(),
-            str(concept).strip(),
+            f'"{str(concept).strip()}"',
             "explained",
+            "tutorial",
         ]
+
+        if subject:
+            parts.append(str(subject).strip())
 
         if learner_level:
 
@@ -1549,6 +1588,36 @@ class ResourceEngine:
             for part in parts
             if part
         )
+
+    # ========================================================
+    # CONCEPT COMPONENTS
+    # ========================================================
+
+    _CONCEPT_STOPWORDS = {
+        "a", "an", "and", "the", "of", "to", "for", "in", "on",
+        "with", "from", "by", "or", "vs", "versus", "basics",
+        "basic", "tutorial", "explained", "explanation", "guide",
+        "introduction", "intro", "learn", "learning", "concept",
+        "concepts", "example", "examples", "understanding",
+    }
+
+    def _get_concept_components(self, concept: str) -> Set[str]:
+        """Return meaningful tokens for arbitrary multi-word topics."""
+        normalized = self._normalize_text(concept)
+        components = set()
+        for token in normalized.split():
+            if token in self._CONCEPT_STOPWORDS:
+                continue
+            if len(token) >= 5:
+                components.add(token)
+        return components
+
+    def _matching_concept_components(self, text: str, concept: str) -> Set[str]:
+        tokens = set(self._normalize_text(text).split())
+        return {
+            token for token in self._get_concept_components(concept)
+            if token in tokens
+        }
 
     # ========================================================
     # GET CONCEPT TERMS

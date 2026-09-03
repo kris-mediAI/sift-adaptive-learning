@@ -128,7 +128,10 @@ class SiftOrchestrator:
                 ContentEngine(
                     model=gemini_provider,
                     strict=True,
-                    allow_fallback=False,
+                    # Keep the learner loop alive if the external model is
+                    # temporarily unavailable. Fallback tasks remain subject
+                    # to the same structural, concept and novelty validation.
+                    allow_fallback=True,
                 )
             )
 
@@ -561,7 +564,6 @@ class SiftOrchestrator:
                     recommendation=recommendation,
                     concept=concept,
                     previous_tasks=previous_tasks,
-                    remaining_minutes=session.remaining_learning_minutes(),
                 )
             )
 

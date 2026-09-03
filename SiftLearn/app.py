@@ -385,6 +385,25 @@ def render_new_session():
             with st.expander("Technical details"): st.code(str(exc))
 
 
+def _evaluate_session_answer(session, rec, task, answer):
+    """Evaluate the visible answer through the canonical Sift path."""
+    with st.spinner("Sift is evaluating your reasoning…"):
+        if (
+            isinstance(getattr(session, "active_intervention", None), dict)
+            and getattr(session, "active_intervention", {}).get("dynamic")
+        ):
+            return sift.complete_dynamic_task(
+                learner_id=rec["learner_id"],
+                question=task["question"],
+                answer=answer.strip(),
+            )
+        return sift.assess(
+            rec["learner_id"],
+            task["question"],
+            answer.strip(),
+        )
+
+
 def render_session():
     rec = current_record(); session = current_backend_session()
     if not rec or not session:
@@ -398,27 +417,33 @@ def render_session():
         task_card(task)
         answer = st.text_area("Your answer", placeholder="Write your reasoning here.", key=f"answer_{st.session_state.dynamic_answer_nonce}")
         if st.button("Check answer →", type="primary", use_container_width=True):
-            if not answer.strip(): st.warning("Write an answer before checking it.")
+            if not answer.strip():
+                st.warning("Write an answer before checking it.")
             else:
                 try:
-                    with st.spinner("Sift is evaluating your reasoning…"):
-                        # Dynamic tasks must go through the completion path so
-                        # the generated task is evaluated, persisted, marked
-                        # complete, and replaced only after evidence is recorded.
-                        if isinstance(getattr(session, "active_intervention", None), dict) and getattr(session, "active_intervention", {}).get("dynamic"):
-                            result = sift.complete_dynamic_task(
-                                learner_id=rec["learner_id"],
-                                question=task["question"],
-                                answer=answer.strip(),
-                            )
-                        else:
-                            result = sift.assess(rec["learner_id"], task["question"], answer.strip())
+                    # Dynamic tasks must go through the completion path so the
+                    # generated task is evaluated, persisted, and replaced only
+                    # after evidence is recorded.
+                    result = _evaluate_session_answer(session, rec, task, answer)
                     st.session_state.last_result = result
                     st.session_state.help_level = 0
                     st.rerun()
                 except Exception as exc:
-                    st.error("Sift could not evaluate this turn.")
-                    with st.expander("Technical details"): st.code(str(exc))
+                    st.error("Sift couldn't evaluate that turn. Your answer is still here — try again in a moment.")
+                    if st.button(
+                        "Try evaluation again →",
+                        key=f"retry_eval_{st.session_state.dynamic_answer_nonce}",
+                        use_container_width=True,
+                    ):
+                        try:
+                            result = _evaluate_session_answer(session, rec, task, answer)
+                            st.session_state.last_result = result
+                            st.session_state.help_level = 0
+                            st.rerun()
+                        except Exception as retry_exc:
+                            st.error("The evaluator is still unavailable. Your answer has not been lost.")
+                            with st.expander("Technical details"):
+                                st.code(str(retry_exc))
     else:
         result = st.session_state.get("last_result")
         if result:

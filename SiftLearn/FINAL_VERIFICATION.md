@@ -17,11 +17,14 @@
 ## Verification
 
 - `python -m compileall -q .` — PASS
-- `python -m pytest -q` — **5 passed, 1 skipped**
+- `python -m pytest -q` — **22 passed, 1 skipped**
 - All `verify_*.py` scripts — PASS
 - UI import-graph smoke test with a Streamlit stub — PASS
 - Dynamic closed-loop regression — PASS
 - Dynamic task persistence/restart regression — PASS
+- Fresh-account first-turn regression — PASS
+- Generated-task concept relevance guard — PASS
+- Gemini transient retry/failover path — covered by resilience tests
 - Dynamic task history/novelty regression — PASS
 - LearningRecord cleanup/compatibility regression — PASS
 

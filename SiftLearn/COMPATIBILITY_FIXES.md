@@ -13,6 +13,6 @@ These are ONLY the three compatibility fixes found by the full pytest run.
 
 3. `core/content_engine.py`
    - Restores the existing safe fallback as the default for direct/offline ContentEngine use.
-   - Production orchestration can still explicitly use `allow_fallback=False`.
+   - Production orchestration now keeps `allow_fallback=True` so temporary provider outages do not strand a learner; generated fallback content is still subject to strict validation.
 
 UI files are intentionally not included.

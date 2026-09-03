@@ -16,6 +16,7 @@ Optional Gemini reliability settings:
 
 ```text
 GEMINI_MODEL=gemini-3.5-flash-lite
+GEMINI_FALLBACK_MODEL=gemini-2.5-flash-lite
 GEMINI_MAX_RETRIES=2
 GEMINI_RETRY_BACKOFF=1.0
 ```
